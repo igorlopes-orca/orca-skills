@@ -44,6 +44,9 @@
 | [`orca-custom-framework`](#orca-custom-framework) | "How do I create a custom compliance framework tailored to my needs?" |
 | [`orca-inactive-identities-cleanup`](#orca-inactive-identities-cleanup) | "Which of our identities are dead weight, and how do we safely disable or delete them?" |
 | [`orca-overprivileged-identities-rightsizing`](#orca-overprivileged-identities-rightsizing) | "Which of our identities hold far more permission than they use, and how do we safely cut them down?" |
+| [`orca-supply-chain-exposure`](skills/orca-supply-chain-exposure/) | "From this list of suspect packages, which are we actually running and where?" |
+| [`orca-cve-blast-radius`](skills/orca-cve-blast-radius/) | "This CVE just dropped — which assets are actually at risk?" |
+| [`orca-account-health`](skills/orca-account-health/) | "Is every account connected, synced, and fully scanned?" |
 
 ### Recommended Workflows
 
@@ -54,6 +57,10 @@
 > **Incident response:** Investigate → Identity review → Asset profile → Contain and remediate
 >
 > **Custom compliance:** Custom framework → Compliance gaps → Impact analysis → Remediate
+>
+> **Reactive (advisory landed):** Supply chain exposure → CVE blast radius → Impact analysis → Fix
+>
+> **Pre-audit / pre-investigation:** Account health → Compliance gaps / Investigate (trust the data first)
 
 ## Installation
 
@@ -1159,39 +1166,6 @@ RIGHT-SIZING SUMMARY  (engine window: ~90 days)
 
 </details>
 
-
-## Testing
-
-All skills include automated evaluations using [Promptfoo](https://www.promptfoo.dev/).
-
-### Run Tests Locally
-
-```bash
-# Install Promptfoo
-npm install -g promptfoo
-
-# Set your API key
-export ANTHROPIC_API_KEY="your-key"
-
-# Run all tests
-promptfoo eval
-
-# View results
-promptfoo view
-```
-
-See [EVALS.md](EVALS.md) for detailed testing guide, including:
-- Test coverage per skill
-- Adding new test cases
-- CI/CD integration
-- Debugging failed tests
-
-**Test suite includes ~30 test cases covering:**
-- Skill triggering from natural language
-- Output format validation
-- Error handling
-- Cross-model compatibility
-- Proactive remediation behavior
 
 ## Contributing
 
