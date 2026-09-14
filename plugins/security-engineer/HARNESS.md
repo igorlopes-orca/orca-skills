@@ -118,7 +118,7 @@ the commit will contain.
 
 | # | Gate | Checks | On failure |
 |---|---|---|---|
-| 1 | **sanity** (`validator.sanity_check`) | Diff is non-empty; within the type's line budget (cve 200, sast 100, iac/secret 50); for `secret` findings, no added line matches a secret pattern; the agent's own `diff_summary` does not name a version its diff never added | `FAILED`, no PR |
+| 1 | **sanity** (`validator.sanity_check`) | Diff is non-empty; within the type's line budget (cve 200, sast 100, iac/secret 50); no added line matches a secret pattern, **whatever the finding type** — a CVE bump that pastes a token into a lockfile fails here too; the agent's own `diff_summary` does not name a version its diff never added | `FAILED`, no PR |
 | 2 | **llm** (`validator.llm_validate`) | A single-shot model call: does this diff address this alert? `pass` / `fail` / `uncertain` | `fail` → `FAILED`. `uncertain` → passes, PR labelled `needs-review` |
 | 3 | **verify** (`pipeline.verify`) | **CVE:** the manifest still declares the package; it is no longer on the version the alert was raised against; if the agent chose a different version, that version carries no known advisory; a lockfile beside the manifest agrees; then `go build ./...` (Go) or `cargo metadata --locked` (Cargo). **Other types:** language build check (below) | `FAILED`, no PR |
 | 4 | **orca** (`validator.orca_check_gate`) | Polls the Orca GitHub App check on the PR head SHA. On failure, pulls the check **annotations** — file, line, message | Reverts the worktree to the branch head, re-invokes the fix agent *with the annotations as feedback*, re-runs gates 1 and 3, and pushes a follow-up commit to the same PR branch. After `max_retries`, follows `on_failure` |
@@ -204,6 +204,46 @@ to `security-engineer-run.json` as NDJSON, and to `NOTIFY_WEBHOOK_URL` if set.
 fix agents.
 
 ---
+
+## Secret findings
+
+A secret finding is the one type where the alert hands the harness the thing it
+must not repeat, and where the pull request is **not** the remediation. The
+credential was committed: it is in git history and live regardless of whether the
+PR merges. Only rotation at the provider fixes it.
+
+The PR is still opened, because it is what makes the exposure visible and gets it
+actioned — but it is not allowed to imply it is the fix:
+
+- The body opens with a warning saying in terms that this does not remediate,
+  that the credential remains in history and live, and that rotation comes first.
+- Rotation is injected as the **first** manual step (`_with_rotation_step`),
+  deterministically rather than left to the impact model to think of — so it
+  reaches the webhook payload as well as the PR body.
+
+**What is redacted, and what cannot be.** The credential is already in the repo,
+so the PR diff adds no audience the repository did not already have. What a run
+adds is the paths that leave the repository's access boundary, and those are
+closed at the point of egress (`redact.py`):
+
+| Path | Redacted |
+|---|---|
+| `llm_validate` prompt → model | Yes — whole prompt, including `alert_json` |
+| `analyze_impact` prompt → model | Yes — whole prompt |
+| Impact `description` / `concerns` / `manual_steps` → PR body | Yes, on parse |
+| PR title and body → GitHub, watch notifications | Yes, immediately before `open-pr` |
+| `NotificationPayload` → console, run log, webhook | Yes, in `_notify_payload` — one chokepoint, so a backend added later inherits it |
+| The commit diff itself | **No — not possible.** A commit that removes a line renders that line. This is what the PR warning exists for |
+
+Candidates come from the alert's `code_snippet`, longest first: the quoted value
+on the right of an assignment, any other quoted literal, and the whole stripped
+line (which is the form a unified diff contains). Keys are never candidates —
+`API_KEY = "sk-live-…"` yields the value, never `API_KEY`, because the variable
+name is exactly what the PR has to tell an operator to set.
+
+Only secret findings build a live redactor. For a SAST or CVE alert the
+`code_snippet` is ordinary vulnerable code, and scrubbing it from the diff would
+blind gate 2 to the lines it has to judge.
 
 ## Degradation policy
 

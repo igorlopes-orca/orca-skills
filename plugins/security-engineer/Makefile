@@ -15,6 +15,7 @@ test:
 	python3 skills/run/tests/test_version_data.py
 	python3 skills/run/tests/test_package_identity.py
 	python3 skills/run/tests/test_pipelines.py
+	python3 skills/run/tests/test_redact.py
 	python3 tools/tests/test_check_manifests.py
 
 # Static checks. CI (.github/workflows/ci.yml at the repository root) runs this

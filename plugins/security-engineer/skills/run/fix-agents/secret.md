@@ -87,7 +87,8 @@ ENV API_KEY=""
 
 ## Important Notes
 
-- **Never** commit the actual secret value, even to remove it — the PR body should only describe the type (e.g. "API key", "database password"), not the value itself.
+- **Removing the secret is not remediation.** The credential was committed, so it stays in git history and stays live until somebody rotates it at the provider. The pull request is cleanup and a visible prompt to rotate — never describe it as the fix.
+- **Never write the value into anything you author.** Not the PR body, not the commit message, not the branch name — describe the type only (e.g. "API key", "database password"). The removal diff is the one place the value unavoidably still appears: a deleted line is rendered by `git`, and no wording changes that. The orchestrator redacts known values from the PR body, the run log, the webhook payload and both model prompts, but treat that as a backstop, not a licence.
 - If the secret appears in multiple files, fix all occurrences in the same branch/PR.
 - The PR body must list every env var name that needs to be set by operators after merge.
 
