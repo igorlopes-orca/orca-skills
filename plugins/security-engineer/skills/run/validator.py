@@ -21,6 +21,7 @@ from pathlib import Path
 
 from _json_util import find_last_json_with_key
 from orca_client import _resolve_feature_type
+from redact import build_redactor
 
 
 @dataclass
@@ -233,14 +234,18 @@ def sanity_check(alert: dict, worktree_path: Path,
         if mismatch:
             failures.append(mismatch)
 
-    if ft == "secret":
-        added = [line for line in diff_text.splitlines()
-                 if line.startswith("+") and not line.startswith("+++")]
-        for line in added:
-            for pat in _SECRET_PATTERNS:
-                if re.search(pat, line):
-                    failures.append("diff adds a line matching a secret pattern")
-                    break
+    # Every feature type, not just "secret". A CVE bump that pastes a token into
+    # a lockfile, or a SAST fix that hardcodes a password to make a call compile,
+    # is exactly as bad as the finding this gate was written for — and until this
+    # ran unconditionally the module docstring's "no new secrets" was only true
+    # for one type in four.
+    added = [line for line in diff_text.splitlines()
+             if line.startswith("+") and not line.startswith("+++")]
+    for line in added:
+        for pat in _SECRET_PATTERNS:
+            if re.search(pat, line):
+                failures.append("diff adds a line matching a secret pattern")
+                break
 
     return ValidationResult(passed=len(failures) == 0, phase="sanity", failures=failures)
 
@@ -275,13 +280,19 @@ Return ONLY this JSON, with nothing before or after it:
 
 
 def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> ValidationResult:
-    diff_text = worktree_diff(worktree_path)[:5000]
+    redactor = build_redactor(alert)
+    # Redact before truncating, not after: slicing first can cut a credential in
+    # half and leave a fragment no candidate matches.
+    diff_text = redactor(worktree_diff(worktree_path))[:5000]
 
     prompt = _LLM_PROMPT.format(
         alert_json=json.dumps(alert, indent=2),
         diff_text=diff_text,
         contract=_SINGLE_SHOT_CONTRACT,
     )
+    # The whole prompt, not just the diff: alert_json carries code_snippet, which
+    # for a secret finding *is* the credential. This is a third-party API call.
+    prompt = redactor(prompt)
     cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
 
@@ -293,15 +304,24 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
                                 failures=["LLM validation timed out — flagged for human review"])
 
     if result.returncode != 0:
-        detail = _subprocess_error_detail(result)
+        # The CLI's own failure output can echo the prompt back, so it is an
+        # egress path too — the console here, and `failures` onward.
+        detail = redactor(_subprocess_error_detail(result))
         print(f"[WARN] LLM validation failed (exit={result.returncode}): {detail}")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
                                 failures=[f"LLM validation errored (exit={result.returncode}): {detail}"])
 
-    return _parse_llm(result.stdout)
+    return _parse_llm(result.stdout, redactor)
 
 
-def _parse_llm(raw: str) -> ValidationResult:
+def _parse_llm(raw: str, redactor=None) -> ValidationResult:
+    """Parse the validation verdict.
+
+    redactor: scrubs the model's own prose. Asked to explain a secret fix, a model
+              will happily name the credential it saw, and `reason` flows on to the
+              run log and the webhook.
+    """
+    redactor = redactor or build_redactor(None)
     try:
         envelope = json.loads(raw)
         text = envelope.get("result", "") or raw
@@ -310,14 +330,14 @@ def _parse_llm(raw: str) -> ValidationResult:
 
     data = find_last_json_with_key(text, "verdict")
     if not data:
-        snippet = text[:200] if text else "(empty)"
+        snippet = redactor(text[:200]) if text else "(empty)"
         print(f"[WARN] could not parse LLM validation output: {snippet}")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
                                 failures=[f"Could not parse LLM validation response: {snippet}"])
 
     verdict = data.get("verdict", "uncertain")
-    reason = data.get("reason", "")
-    concerns = data.get("concerns") or []
+    reason = redactor(data.get("reason", ""))
+    concerns = redactor.scrub(data.get("concerns") or [])
 
     if verdict == "fail":
         return ValidationResult(passed=False, phase="llm", failures=[reason])

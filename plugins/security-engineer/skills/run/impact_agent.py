@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass, field
 
 from _json_util import find_last_json_with_key
+from redact import build_redactor
 from validator import (
     _SINGLE_SHOT_CONTRACT,
     _SINGLE_SHOT_MAX_TURNS,
@@ -133,12 +134,16 @@ def analyze_impact(
     fix_context: a specialist's FixPlan.metadata, when the type produced one.
                  Facts the model would otherwise have to infer from the diff.
     """
+    redactor = build_redactor(alert_json)
     prompt = _PROMPT.format(
         alert_json=json.dumps(alert_json, indent=2),
-        diff_text=diff_text[:6000],
+        diff_text=redactor(diff_text)[:6000],
         fix_context=_render_fix_context(fix_context),
         contract=_SINGLE_SHOT_CONTRACT,
     )
+    # alert_json and fix_context are in here too, and for a secret finding the
+    # alert's code_snippet is the credential. Scrub the assembled prompt.
+    prompt = redactor(prompt)
     # No tools at all — see _SINGLE_SHOT_TOOL_FLAGS for why denying them was
     # not the same thing, and cost 6x more.
     cmd = [
@@ -163,7 +168,7 @@ def analyze_impact(
     if result.returncode != 0:
         # claude reports its own failures on stdout, not stderr — see
         # _subprocess_error_detail. Logging stderr alone printed an empty string.
-        detail = _subprocess_error_detail(result)
+        detail = redactor(_subprocess_error_detail(result))
         print(f"[WARN] impact analysis failed (exit={result.returncode}): {detail}")
         return ImpactResult(
             level="medium",
@@ -172,10 +177,18 @@ def analyze_impact(
             error=f"exit_code={result.returncode}: {detail}",
         )
 
-    return _parse(result.stdout)
+    return _parse(result.stdout, redactor)
 
 
-def _parse(raw: str) -> ImpactResult:
+def _parse(raw: str, redactor=None) -> ImpactResult:
+    """Parse the impact verdict.
+
+    redactor: description, concerns and manual_steps are pasted verbatim into the
+              PR body and the webhook payload, so the model's prose is an egress
+              path like any other. A model explaining why removing a hardcoded
+              credential is risky can name the credential.
+    """
+    redactor = redactor or build_redactor(None)
     try:
         envelope = json.loads(raw)
         text = envelope.get("result", "") or raw
@@ -184,7 +197,7 @@ def _parse(raw: str) -> ImpactResult:
 
     data = find_last_json_with_key(text, "level")
     if not data:
-        snippet = text[:200] if text else "(empty)"
+        snippet = redactor(text[:200]) if text else "(empty)"
         print(f"[WARN] could not parse impact analysis output: {snippet}")
         return ImpactResult(
             level="medium",
@@ -195,9 +208,9 @@ def _parse(raw: str) -> ImpactResult:
 
     return ImpactResult(
         level=data.get("level", "medium"),
-        description=data.get("description", ""),
+        description=redactor(data.get("description", "")),
         downtime_risk=bool(data.get("downtime_risk", False)),
         requires_deploy=bool(data.get("requires_deploy", True)),
-        manual_steps=data.get("manual_steps") or [],
-        concerns=data.get("concerns") or [],
+        manual_steps=redactor.scrub(data.get("manual_steps") or []),
+        concerns=redactor.scrub(data.get("concerns") or []),
     )
