@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 from _json_util import find_last_json_with_key
+from paths import resolve_within
 from validator import _SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS, _subprocess_error_detail
 from version_data import Ecosystem, ecosystem_for_manifest
 
@@ -452,7 +453,11 @@ def identify_package(alert: dict, worktree_path,
         return ref
     ref.ecosystem = eco
 
-    manifest_abs = Path(worktree_path) / manifest_rel
+    # manifest_rel comes from the alert, and `/` does not normalise a "../".
+    manifest_abs = resolve_within(worktree_path, manifest_rel)
+    if manifest_abs is None:
+        ref.error = f"manifest path escapes the worktree: {manifest_rel!r}"
+        return ref
     deps = read_manifest(manifest_abs)
     if not deps:
         ref.error = f"no dependencies parsed from {manifest_rel}"

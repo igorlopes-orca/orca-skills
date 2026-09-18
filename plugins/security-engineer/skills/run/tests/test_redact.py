@@ -189,7 +189,10 @@ class TestPullRequestBody(unittest.TestCase):
             feature_type=feature_type, source="app.py:14",
             alert_json=alert, worktree_path=Path("/tmp/x"),
         )
-        task.fix_result = orchestrator.FixAgentResult(success=True, diff_summary=diff_summary)
+        # files_changed is what _commit_and_pr stages by name, so a task without
+        # it is not one the pipeline could ever produce.
+        task.fix_result = orchestrator.FixAgentResult(
+            success=True, diff_summary=diff_summary, files_changed=["app.py"])
         with patch("orchestrator._run",
                    return_value=("https://github.com/o/r/pull/1", "", 0)) as run:
             orchestrator._commit_and_pr(task, impact=impact, dry_run=False)
@@ -223,7 +226,8 @@ class TestPullRequestBody(unittest.TestCase):
             feature_type="secret", source="app.py:14",
             alert_json=alert, worktree_path=Path("/tmp/x"),
         )
-        task.fix_result = orchestrator.FixAgentResult(success=True, diff_summary="x")
+        task.fix_result = orchestrator.FixAgentResult(
+            success=True, diff_summary="x", files_changed=["app.py"])
         with patch("orchestrator._run",
                    return_value=("https://github.com/o/r/pull/1", "", 0)) as run:
             orchestrator._commit_and_pr(task, impact=None, dry_run=False)

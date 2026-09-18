@@ -287,13 +287,59 @@ def cmd_git_setup(args):
         sys.exit(1)
 
 
+def _stage(paths):
+    """Stage exactly `paths`, and refuse to commit a tree we cannot account for.
+
+    This used to be `git add -A`, which committed everything in the worktree —
+    so anything the fix agent's Bash left behind that .gitignore did not cover
+    (a scratch file, a restore artefact tree, a dumped environment) was pushed
+    along with the fix. The diff budget was no defence: a small file passes it.
+
+    Staging by name means an undeclared file never reaches the commit. It is
+    still visible to every gate, because worktree_diff registers untracked files
+    with `git add -A -N` on purpose. What we do not do is guess: a leftover is
+    either an under-reported fix or a stray artefact, this cannot tell which, and
+    committing on the wrong guess is how a secret gets pushed. So it fails.
+
+    With no paths at all, behaviour is the old blanket stage. The orchestrator
+    always passes them; the fallback is for a human driving this CLI by hand.
+    """
+    if not paths:
+        run(["git", "add", "-A"])
+        return
+    run(["git", "add", "--", *paths])
+    leftover = _unaccounted_changes()
+    if leftover:
+        raise RuntimeError(
+            "worktree holds changes the fix agent did not report: "
+            + ", ".join(sorted(leftover)[:10]))
+
+
+def _unaccounted_changes():
+    """Paths git would still commit that were not staged by name.
+
+    Read after staging the fix agent's declared files: anything left is either a
+    file the agent changed and did not report, or something its Bash left behind.
+    We cannot tell those apart from here, and both are reasons not to push.
+    """
+    out, _, _ = run(["git", "status", "--porcelain", "--untracked-files=all"])
+    leftover = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        index_state, worktree_state, path = line[0], line[1], line[3:]
+        if index_state == "?" or worktree_state != " ":
+            leftover.append(path)
+    return leftover
+
+
 def cmd_git_commit(args):
     if args.dry_run:
         print(f"dry-run: would commit with message: {args.message}")
         return
 
     try:
-        run(["git", "add", "-A"])
+        _stage(getattr(args, "path", None) or [])
         run(["git", "commit", "-m", args.message])
         # Extract SHA from "1 file changed" line or git log
         sha, _, _ = run(["git", "rev-parse", "--short", "HEAD"])
@@ -377,9 +423,12 @@ def main():
     p_git.add_argument("alert_id")
 
     # git-commit
-    p_commit = sub.add_parser("git-commit", help="Stage all and commit")
+    p_commit = sub.add_parser("git-commit", help="Stage the named files and commit")
     p_commit.add_argument("alert_id")
     p_commit.add_argument("message")
+    p_commit.add_argument("--path", action="append", default=[],
+                          help="File to stage, repeatable. Without any, stages "
+                               "everything — the orchestrator always passes them.")
 
     # open-pr
     p_pr = sub.add_parser("open-pr", help="Push branch and open PR")
