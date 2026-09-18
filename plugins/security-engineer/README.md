@@ -24,7 +24,10 @@ Orca alerts
 
 Nothing is merged automatically. Every run ends at an open PR with an impact
 label, a version rationale, and a `needs-review` flag wherever a gate passed
-without being able to confirm.
+without being able to confirm — with the reason written into the PR body, not
+only onto the label. The labels it uses (`needs-review`, `ci-failed`,
+`impact:<level>`) are created in the target repo on first use, so there is
+nothing to pre-create.
 
 **How and why it holds together — the gates, the data sources, what fails open
 and what fails closed: [`HARNESS.md`](HARNESS.md).**

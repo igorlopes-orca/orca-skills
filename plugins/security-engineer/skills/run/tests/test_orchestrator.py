@@ -30,9 +30,14 @@ from orca_client import RISK_ORDER, Repository, _resolve_feature_type, is_fixabl
 from orchestrator import (
     AlertTask,
     FixAgentResult,
+    _add_label,
+    _build_pr_body,
     _commit_and_pr,
+    _flag_review,
     _invoke_fix_agent,
     _print_scan_report,
+    _review_section,
+    _sync_pr_body,
     _validate_flags,
     main,
     run_one,
@@ -2374,12 +2379,203 @@ class TestNoDuplicateImpactRendering(unittest.TestCase):
         self.assertNotIn("pr\", \"comment", Path(notifier.__file__).read_text())
 
     def test_pr_body_still_carries_the_assessment(self):
-        """Dropping the comment must not drop the content — the body keeps it."""
+        """Dropping the comment must not drop the content — the body keeps it.
+
+        Reads _build_pr_body, which is where the body moved when it had to become
+        re-renderable for post-PR review reasons. _commit_and_pr now only calls it.
+        """
         import inspect
-        src = inspect.getsource(orchestrator._commit_and_pr)
+        src = inspect.getsource(orchestrator._build_pr_body)
         for fragment in ("Required Manual Steps", "Reviewer Concerns",
                          "impact.manual_steps", "impact.concerns"):
             self.assertIn(fragment, src, f"PR body lost {fragment}")
+
+
+# ---------------------------------------------------------------------------
+# 29. The needs-review marker does not depend on a prepared repo
+# ---------------------------------------------------------------------------
+
+def _ok(returncode=0, stderr=""):
+    return subprocess.CompletedProcess(args=["gh"], returncode=returncode,
+                                       stdout="", stderr=stderr)
+
+
+class TestLabelsAreCreatedBeforeUse(unittest.TestCase):
+    """`gh pr edit --add-label` errors on a repo that does not define the label.
+
+    Nothing created them, so on a fresh repo — every repo, under `--remote all`
+    — all three label calls failed and left a [WARN] on stderr as the only
+    trace. The PR was already open by then, which is what made it the worst
+    ordering available.
+    """
+
+    PR = "https://github.com/owner/repo/pull/7"
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_create_precedes_edit(self, mock_run):
+        _add_label(self.PR, "needs-review")
+        create, edit = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(create[:3], ["gh", "label", "create"])
+        self.assertEqual(edit[:3], ["gh", "pr", "edit"])
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_create_is_idempotent_and_repo_scoped(self, mock_run):
+        """--force is what lets this run against a repo that already has them."""
+        _add_label(self.PR, "needs-review")
+        create = mock_run.call_args_list[0].args[0]
+        self.assertIn("--force", create)
+        self.assertEqual(create[create.index("--repo") + 1], "owner/repo")
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_every_label_the_run_applies_has_a_spec(self, mock_run):
+        """A label created without a colour is a gh error, not a grey label."""
+        for label in ("needs-review", "ci-failed",
+                      "impact:low", "impact:medium", "impact:high"):
+            self.assertIn(label, orchestrator._LABEL_SPECS, label)
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_unlisted_impact_level_still_gets_created(self, mock_run):
+        """impact.level is model output, so it is not a closed set."""
+        _add_label(self.PR, "impact:catastrophic")
+        create = mock_run.call_args_list[0].args[0]
+        self.assertIn("--color", create)
+        self.assertEqual(len(mock_run.call_args_list), 2)
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_unparseable_url_skips_creation_but_still_labels(self, mock_run):
+        _add_label("not-a-pr-url", "needs-review")
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0][:3], ["gh", "pr", "edit"])
+
+    @patch("orchestrator.subprocess.run", return_value=_ok(1, "label not found"))
+    def test_label_failure_is_not_fatal(self, mock_run):
+        """Both calls can fail; the body is what carries the warning regardless."""
+        _add_label(self.PR, "needs-review")  # must not raise
+
+
+class TestReviewReasonReachesThePrBody(unittest.TestCase):
+    """The label is applied after the PR is open, so it can fail with the PR
+    already published. The body is an argument to `gh pr create` — it lands, or
+    there is no PR. So the reason lives there, not only on the label.
+    """
+
+    def _task(self, **kw):
+        base = {
+            "alert_id": "orca-1", "title": "Path Traversal", "risk_level": "high",
+            "feature_type": "sast", "source": "server.js:40",
+            "alert_json": {"alert_id": "orca-1", "feature_type": "sast"},
+        }
+        base.update(kw)
+        return AlertTask(**base)
+
+    def test_no_reasons_renders_nothing(self):
+        self.assertEqual(_review_section([]), "")
+        self.assertNotIn("Needs human review", _build_pr_body(self._task(), None))
+
+    def test_reason_appears_in_the_body(self):
+        task = self._task()
+        _flag_review(task, "LLM validation was uncertain: unclear if input is sanitised")
+        body = _build_pr_body(task, None)
+        self.assertIn("Needs human review", body)
+        self.assertIn("unclear if input is sanitised", body)
+
+    def test_reasons_are_flattened_and_deduplicated(self):
+        """A model concern arrives as prose, and would break the blockquote."""
+        task = self._task()
+        _flag_review(task, "line one\n   line two")
+        _flag_review(task, "line one line two")
+        self.assertEqual(task.review_reasons, ["line one line two"])
+        self.assertNotIn("\n", task.review_reasons[0])
+
+    def test_empty_reason_still_flags_the_task(self):
+        """A gate that reports no detail must not silently un-flag the PR."""
+        task = self._task()
+        _flag_review(task, "")
+        self.assertTrue(task.needs_review)
+        self.assertEqual(task.review_reasons, [])
+
+    def test_reasons_are_redacted_for_a_secret_finding(self):
+        """A gate's own prose can quote the credential it was asked about."""
+        value = "example-placeholder-value"
+        task = self._task(
+            feature_type="secret",
+            alert_json={"alert_id": "orca-1", "feature_type": "secret",
+                        "code_snippet": [f'API_KEY = "{value}"']},
+        )
+        _flag_review(task, f"LLM validation was uncertain: {value} may still be live")
+        body = _build_pr_body(task, None)
+        self.assertNotIn(value, body)
+        self.assertIn("Needs human review", body)
+
+
+class TestPostPrReasonsAreRepublished(unittest.TestCase):
+    """The Orca check runs after the PR is open, so a reason it raises is not
+    known when the body is first written."""
+
+    def _opened_task(self):
+        task = AlertTask(
+            alert_id="orca-2", title="Hardcoded secret", risk_level="high",
+            feature_type="sast", source="a.py:1",
+            alert_json={"alert_id": "orca-2", "feature_type": "sast"},
+        )
+        task.pr_url = "https://github.com/owner/repo/pull/9"
+        task.pr_body = _build_pr_body(task, None)
+        return task
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_new_reason_is_pushed_to_the_body(self, mock_run):
+        task = self._opened_task()
+        _flag_review(task, "Orca check inconclusive: check never reported")
+        _sync_pr_body(task)
+        cmd = mock_run.call_args_list[0].args[0]
+        self.assertEqual(cmd[:3], ["gh", "pr", "edit"])
+        self.assertIn("check never reported", cmd[cmd.index("--body") + 1])
+        self.assertIn("check never reported", task.pr_body)
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_unchanged_body_is_not_republished(self, mock_run):
+        _sync_pr_body(self._opened_task())
+        mock_run.assert_not_called()
+
+    @patch("orchestrator.subprocess.run", return_value=_ok())
+    def test_no_pr_is_a_no_op(self, mock_run):
+        """Dry-run never opens a PR, so there is nothing to edit."""
+        task = self._opened_task()
+        task.pr_url = None
+        _flag_review(task, "some reason")
+        _sync_pr_body(task)
+        mock_run.assert_not_called()
+
+    @patch("orchestrator.subprocess.run", return_value=_ok(1, "could not edit"))
+    def test_failed_edit_does_not_record_a_body_that_was_never_published(self, mock_run):
+        task = self._opened_task()
+        before = task.pr_body
+        _flag_review(task, "Orca check inconclusive")
+        _sync_pr_body(task)
+        self.assertEqual(task.pr_body, before)
+
+
+class TestEveryGateRecordsWhy(unittest.TestCase):
+    """needs_review used to be a bare bool, so the reason each gate had was
+    discarded at the point it was set. Every site must go through _flag_review.
+    """
+
+    def test_no_site_sets_the_bool_directly(self):
+        src = inspect.getsource(orchestrator._run_pipeline)
+        self.assertNotIn("task.needs_review = True", src,
+                         "a gate flagged review without recording why")
+
+    def test_ci_failure_is_flagged_too(self):
+        """A red CI is a gate that could not confirm the fix."""
+        src = inspect.getsource(orchestrator._run_pipeline)
+        self.assertIn('_flag_review(task, f"CI failed on this PR', src)
+
+    def test_body_is_synced_before_labels_are_applied(self):
+        """The reliable copy goes first; the filterable one follows."""
+        src = inspect.getsource(orchestrator._run_pipeline)
+        self.assertLess(src.index("_sync_pr_body(task)"),
+                        src.index('_add_label(pr_url, "needs-review")'))
 
 
 # ---------------------------------------------------------------------------
@@ -2438,6 +2634,10 @@ if __name__ == "__main__":
         TestCveQueryShape,
         TestReposWithCve,
         TestLocalFetchFailureIsReported,
+        TestLabelsAreCreatedBeforeUse,
+        TestReviewReasonReachesThePrBody,
+        TestPostPrReasonsAreRepublished,
+        TestEveryGateRecordsWhy,
     ]
 
     # The list above is hand-maintained, so a new test class that nobody adds to
