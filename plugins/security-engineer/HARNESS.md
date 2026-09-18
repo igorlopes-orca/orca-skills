@@ -213,6 +213,41 @@ the body is what makes the warning reliable.
 Every state transition is emitted to the console, to `security-engineer-run.json`
 as NDJSON, and to `NOTIFY_WEBHOOK_URL` if set.
 
+**A cloned tree is input, never configuration.** `--remote all` clones arbitrary
+tenant repositories into `/tmp`, and the fix agent runs with `cwd` inside one.
+A repository configures Claude Code simply by containing files — `CLAUDE.md`,
+`.claude/settings.json`, `.claude/agents/*`, hooks, MCP server definitions — so
+without pinning, checking out a tree is enough to steer the process holding our
+push rights. No alert required. Every fix agent subprocess therefore runs with
+`--safe-mode --setting-sources user --settings <plugin file> --strict-mcp-config`:
+configuration comes from `skills/run/agent-settings.json`, which is versioned
+beside the code, and from nothing in the clone. Verified against claude 2.1.276 —
+with a `CLAUDE.md` imposing a house style in the working directory, an unpinned
+`claude -p` followed it and a pinned one did not.
+
+**Only declared files are committed.** Staging was `git add -A`, so anything the
+fix agent's Bash left behind that `.gitignore` did not cover — a scratch file, a
+restore artefact tree, a dumped environment — was committed and pushed with the
+fix, and the 50–200 line diff budget waves a small file straight through. The
+commit now stages the paths the agent reported in `files_changed`, each one
+resolved and checked to be inside the worktree. Anything left over fails the
+alert rather than being committed or silently dropped: it is either an
+under-reported fix or a stray artefact, this cannot tell which, and guessing
+wrong is how a secret gets pushed. Gates are unaffected — `worktree_diff`
+registers untracked files with `git add -A -N` on purpose, so an undeclared file
+is still judged, it just never reaches the commit.
+
+**Alert-derived paths are sanitised, not trusted.** `Path.__truediv__` does not
+normalise, so `worktree / "../../etc/passwd"` is a path outside the worktree that
+reads like one inside it. `paths.py` holds the two rules: anything used as a
+filename goes through `safe_name` (an allowlist — the worktree directory is named
+from `alert_id` and is later an argument to `shutil.rmtree`), and anything joined
+onto a root goes through `resolve_within`, which resolves both sides and so
+catches a symlink planted in a cloned repository as well as a `../`.
+`assert_disposable` guards every `rmtree`: directly under `/tmp`, and named
+`orca-fix-*`. The comment that used to justify that delete read "ours by naming
+convention", which was work a check should do on a value that arrives from the API.
+
 **Concurrency is capped.** 4 alerts per repo, 3 repos — at most 12 concurrent
 fix agents.
 

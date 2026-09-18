@@ -21,6 +21,7 @@ from pathlib import Path
 
 from _json_util import find_last_json_with_key
 from orca_client import _resolve_feature_type
+from paths import resolve_within
 from redact import build_redactor
 
 
@@ -403,7 +404,13 @@ def _find_project_root(files: list[str], worktree_path: Path, marker: str) -> Pa
     for f in files:
         # Strip line number suffix (e.g. "nodejs-app/server.js:40" → "nodejs-app/server.js")
         clean = f.split(":")[0] if ":" in f else f
-        candidate = (worktree_path / clean).parent
+        # `worktree_path / clean` does not normalise, so a "../" in an alert's
+        # source used to walk straight out of the worktree — and the loop guard
+        # below compares paths lexicographically, which does not catch it.
+        inside = resolve_within(worktree_path, clean)
+        if inside is None:
+            continue
+        candidate = inside.parent
         while candidate >= worktree_path:
             if (candidate / marker).exists():
                 return candidate
@@ -418,7 +425,10 @@ def _find_terraform_root(files: list[str], worktree_path: Path) -> Path:
     for f in files:
         if not f.endswith(".tf"):
             continue
-        tf_dir = (worktree_path / f).parent
+        inside = resolve_within(worktree_path, f)
+        if inside is None:
+            continue
+        tf_dir = inside.parent
         if tf_dir.exists():
             return tf_dir
     return worktree_path

@@ -38,6 +38,13 @@ from orca_client import (
     normalize_alert_id,
     repos_with_cve,
 )
+from paths import (
+    WORKTREE_PREFIX,
+    WORKTREE_ROOT,
+    assert_disposable,
+    resolve_within,
+    safe_name,
+)
 from pipelines import FixPlan, get_pipeline
 from redact import build_redactor
 from validator import (
@@ -50,6 +57,31 @@ from validator import (
 )
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
+
+# The fix agent runs with cwd inside a repository we cloned from the tenant, and
+# a repository configures Claude Code just by containing files: CLAUDE.md,
+# .claude/settings.json, .claude/agents/*, hooks, MCP server definitions. None of
+# that needs an alert to reach the agent — checking out the tree is enough — so
+# a cloned tree could steer the process that holds our push rights.
+#
+# These flags pin the subprocess to configuration this plugin owns:
+#   --safe-mode       ignores CLAUDE.md, skills, plugins, hooks, custom agents
+#                     and MCP servers discovered from the tree
+#   --setting-sources drops the clone's project and local settings.json; the
+#                     operator's own user settings stay, since auth lives there
+#   --settings        the one settings file we do load, versioned beside this code
+#   --strict-mcp-config  no MCP servers beyond what --mcp-config names, i.e. none
+#
+# Verified against claude 2.1.276: with a CLAUDE.md in the working directory
+# imposing a house style, an unpinned `claude -p` followed it and a pinned one
+# did not.
+_AGENT_SETTINGS = str(_THIS_DIR / "agent-settings.json")
+_PINNED_CONFIG_FLAGS = [
+    "--safe-mode",
+    "--setting-sources", "user",
+    "--settings", _AGENT_SETTINGS,
+    "--strict-mcp-config",
+]
 
 CFG = load_config()
 MAX_WORKERS = CFG.max_parallel_fixes
@@ -140,9 +172,13 @@ class WorktreeConflict(RuntimeError):
 
 
 def _worktree_path(alert_id: str, repo: Repository | None = None) -> Path:
-    """Namespace the worktree by repo so parallel --remote all runs cannot collide."""
-    prefix = f"{repo.name.replace('/', '-')}-" if (repo and repo.name) else ""
-    return Path(f"/tmp/orca-fix-{prefix}{alert_id}")
+    """Namespace the worktree by repo so parallel --remote all runs cannot collide.
+
+    Both halves are sanitised. repo.name always was; alert_id was not, and it
+    arrives from the API and ends up as an argument to shutil.rmtree.
+    """
+    prefix = f"{safe_name(repo.name)}-" if (repo and repo.name) else ""
+    return WORKTREE_ROOT / f"{WORKTREE_PREFIX}{prefix}{safe_name(alert_id)}"
 
 
 def _local_branch_exists(branch: str, cwd: str | None) -> bool:
@@ -191,7 +227,9 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
                        capture_output=True, cwd=cwd)
         if path.exists():
             # Not a registered worktree of this repo — e.g. the clone it belonged
-            # to was already deleted. Ours by naming convention, so clear it.
+            # to was already deleted. Ours by naming convention, and now checked
+            # rather than assumed, because the name is built from an alert field.
+            assert_disposable(path)
             shutil.rmtree(path, ignore_errors=True)
         if path.exists():
             raise RuntimeError(f"could not clear stale worktree at {path}")
@@ -264,6 +302,11 @@ You are a specialist security fix agent. Fix ONE specific vulnerability.
 - Your branch is already created and checked out. Do NOT run git-setup.
 - Do NOT run git commit or git push. The orchestrator handles those after validation.
 - Apply the fix, then verify the change was applied correctly.
+- `files_changed` must list EVERY file you created or modified, including files a
+  command regenerated for you such as a lockfile. Only the files you list are
+  committed, and a worktree holding changes you did not list fails the run.
+- Do not leave scratch files, backups or dumps behind. Delete anything you created
+  that is not part of the fix.
 - Print ONLY the JSON block below as your very last output (nothing after it).
 
 ## Full Alert Data (reference)
@@ -398,6 +441,7 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
 
     cmd = [
         "claude", "-p", prompt,
+        *_PINNED_CONFIG_FLAGS,
         "--allowedTools", tools,
         "--output-format", "json",
         "--max-turns", "20",
@@ -708,6 +752,29 @@ def _sync_pr_body(task: AlertTask) -> None:
     task.pr_body = body
 
 
+def _declared_paths(task: AlertTask) -> list[str]:
+    """The files the fix agent reported, each checked to be inside the worktree.
+
+    These are the only paths that get staged. A reported path that resolves
+    outside the worktree — a `../`, an absolute path, a symlink planted in the
+    cloned tree — fails the alert rather than being silently dropped, because a
+    fix agent has no reason to produce one and we would rather see it.
+    """
+    root = Path(task.worktree_path).resolve()
+    declared = []
+    for raw in (task.fix_result.files_changed if task.fix_result else []):
+        rel = str(raw or "").split(":")[0].strip()
+        if not rel:
+            continue
+        resolved = resolve_within(root, rel)
+        if resolved is None:
+            raise RuntimeError(f"fix agent reported a path outside the worktree: {raw}")
+        declared.append(str(resolved.relative_to(root)))
+    if not declared:
+        raise RuntimeError("fix agent reported no files_changed — nothing to stage")
+    return sorted(set(declared))
+
+
 def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) -> str | None:
     """Stage, commit, and open PR. Returns PR URL or None (dry-run)."""
     if dry_run:
@@ -719,7 +786,8 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
     pr_title = redactor(f"fix(security): {task.title[:60]} [{task.alert_id}]")
     pr_body = _build_pr_body(task, impact)
 
-    _run(["python3", _RUN_AGENT, "git-commit", task.alert_id, commit_msg],
+    stage_args = [arg for path in _declared_paths(task) for arg in ("--path", path)]
+    _run(["python3", _RUN_AGENT, "git-commit", task.alert_id, commit_msg, *stage_args],
          cwd=task.worktree_path)
 
     stdout, _, _ = _run([
@@ -736,9 +804,13 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
 
 
 def _push_fix_update(task: AlertTask) -> None:
-    """Stage, commit, and push updated fix to the existing PR branch."""
+    """Stage, commit, and push updated fix to the existing PR branch.
+
+    Scoped the same way as the first commit — a retry runs the same fix agent in
+    the same worktree, so it can leave the same debris behind.
+    """
     commit_msg = f"fix(security): retry fix for {task.alert_id}"
-    _run(["git", "add", "-A"], cwd=task.worktree_path)
+    _run(["git", "add", "--", *_declared_paths(task)], cwd=task.worktree_path)
     _run(["git", "commit", "-m", commit_msg], cwd=task.worktree_path)
     _run(["git", "push"], cwd=task.worktree_path)
 

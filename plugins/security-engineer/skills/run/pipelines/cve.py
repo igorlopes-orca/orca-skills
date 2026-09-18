@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from package_identity import find_dependency, identify_package, read_manifest
+from paths import resolve_within
 from validator import ValidationResult, _find_project_root, _run_check
 
 from pipelines.base import FixPipeline, FixPlan
@@ -191,7 +192,12 @@ class CvePipeline(FixPipeline):
             return super().verify(task, worktree_path, plan)
 
         failures = []
-        manifest_abs = Path(worktree_path) / manifest_rel
+        # manifest_rel travelled here from the alert via the plan's metadata.
+        manifest_abs = resolve_within(worktree_path, manifest_rel)
+        if manifest_abs is None:
+            return ValidationResult(
+                passed=False, phase="cve_verify",
+                failures=[f"manifest path escapes the worktree: {manifest_rel!r}"])
         applied = self._applied_version(manifest_abs, package, ref)
 
         started_at = ref.get("current_version")
