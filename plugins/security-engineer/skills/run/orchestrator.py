@@ -40,7 +40,14 @@ from orca_client import (
 )
 from pipelines import FixPlan, get_pipeline
 from redact import build_redactor
-from validator import ci_gate, llm_validate, orca_check_gate, sanity_check, worktree_diff
+from validator import (
+    _parse_pr_url,
+    ci_gate,
+    llm_validate,
+    orca_check_gate,
+    sanity_check,
+    worktree_diff,
+)
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
 
@@ -87,6 +94,12 @@ class AlertTask:
     fix_result: FixAgentResult | None = None
     impact: ImpactResult | None = None
     needs_review: bool = False
+    # Why review is needed, one entry per gate that could not confirm the fix.
+    # The bool drives the label; these survive the label failing to apply.
+    review_reasons: list[str] = field(default_factory=list)
+    # The PR body as last published, so a reason discovered after the PR opened
+    # can be compared against it and pushed only when it actually changed.
+    pr_body: str = ""
     attempts: int = 0
     # What the type's specialist worked out before the agent ran. Carried on the
     # task because impact analysis, the PR body and the retry loop all need it.
@@ -535,18 +548,108 @@ def _with_rotation_step(impact: ImpactResult | None, feature_type: str) -> Impac
     return impact
 
 
-def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) -> str | None:
-    """Stage, commit, and open PR. Returns PR URL or None (dry-run)."""
-    if dry_run:
-        print(f"  [dry-run] would commit and open PR for {task.alert_id}")
-        return None
+# ---------------------------------------------------------------------------
+# Review markers
+# ---------------------------------------------------------------------------
 
-    # Built once here and applied to everything this function authors. The diff
-    # itself cannot be scrubbed — a commit that removes a line renders that line —
-    # which is what _SECRET_WARNING exists to say out loud.
+# Every label this run applies, with the colour and description to use when it
+# has to be created. `gh pr edit --add-label` fails outright against a repo that
+# does not already define the label, and on a fresh repo — the common case under
+# `--remote all` — that is every label here. The old failure ordering was the
+# worst one available: the PR is open and pushed, and the only thing missing is
+# the marker saying not to trust it. Creating them first makes a fresh repo the
+# same case as a prepared one, so an operator has nothing to set up by hand.
+_LABEL_SPECS = {
+    "needs-review":  ("fbca04", "Automated fix that an Orca gate could not confirm"),
+    "ci-failed":     ("d73a4a", "CI failed on an automated Orca fix"),
+    "impact:low":    ("0e8a16", "Automated fix assessed as low production impact"),
+    "impact:medium": ("fbca04", "Automated fix assessed as medium production impact"),
+    "impact:high":   ("d73a4a", "Automated fix assessed as high production impact"),
+}
+
+# impact.level is whatever the impact model returned, so a level outside the
+# three above still gets a label rather than an unstyled failure.
+_DEFAULT_LABEL_SPEC = ("ededed", "Automated fix from the Orca security engineer")
+
+
+def _ensure_label(owner_repo: str, label: str) -> None:
+    """Create `label` in the target repo, or update it if it is already there.
+
+    `--force` is what makes this idempotent: it creates the label, or rewrites
+    the colour and description of an existing one, and exits 0 either way. A
+    failure here is not fatal — the caller still tries the label, and the PR body
+    carries the reason whether or not either succeeds.
+    """
+    color, description = _LABEL_SPECS.get(label, _DEFAULT_LABEL_SPEC)
+    r = subprocess.run(
+        ["gh", "label", "create", label, "--repo", owner_repo,
+         "--color", color, "--description", description, "--force"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"[WARN] could not create label {label} in {owner_repo}: {r.stderr[:200]}")
+
+
+def _add_label(pr_url: str, label: str) -> None:
+    """Apply `label` to the PR, creating it in the repo first."""
+    try:
+        owner_repo, _ = _parse_pr_url(pr_url)
+    except ValueError:
+        # Not a URL we can resolve to a repo — skip creation and let the edit
+        # report whatever gh makes of it.
+        owner_repo = ""
+    if owner_repo:
+        _ensure_label(owner_repo, label)
+    r = subprocess.run(["gh", "pr", "edit", pr_url, "--add-label", label],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[WARN] failed to add {label} label: {r.stderr[:200]}")
+
+
+def _flag_review(task: AlertTask, reason: str) -> None:
+    """Mark the task for human review and record why.
+
+    The bool drives the label. The reason is what survives the label not being
+    applied, because it goes in the PR body — see _review_section. Whitespace is
+    flattened since a model's concern can arrive as several lines, which would
+    break the blockquote the body renders it in.
+    """
+    task.needs_review = True
+    flat = " ".join((reason or "").split())
+    if flat and flat not in task.review_reasons:
+        task.review_reasons.append(flat)
+
+
+def _review_section(reasons: list[str]) -> str:
+    """The needs-review warning as it appears at the top of the PR body.
+
+    The label is the marker this plugin advertises, and it is the one part of the
+    run that can fail *after* the PR is already open. The body cannot fail that
+    way: it is an argument to `gh pr create`, so either it lands or there is no
+    PR to mislead anyone. Whatever becomes of the label, the reason is here.
+    """
+    if not reasons:
+        return ""
+    bullets = "\n".join(f"> - {r}" for r in reasons)
+    return ("> [!IMPORTANT]\n"
+            "> **Needs human review.** An automated gate could not confirm this "
+            "change:\n"
+            ">\n"
+            f"{bullets}\n\n")
+
+
+def _build_pr_body(task: AlertTask, impact: ImpactResult | None) -> str:
+    """Render the PR body from the task's current state.
+
+    Kept separate from _commit_and_pr so it can be re-rendered after the PR is
+    open: the Orca check runs post-PR, so a reason it raises is not known at the
+    moment the body is first written. Everything it reads lives on the task, so
+    rebuilding later picks up the final state rather than a stale snapshot.
+    """
+    # Built here and applied to everything this returns. The diff itself cannot
+    # be scrubbed — a commit that removes a line renders that line — which is
+    # what _SECRET_WARNING exists to say out loud.
     redactor = build_redactor(task.alert_json)
-
-    commit_msg = redactor(f"fix(security): {task.title} ({task.alert_id})")
 
     impact_level = impact.level if impact else "unknown"
     impact_desc = impact.description if impact else ""
@@ -566,6 +669,7 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
 
     pr_body = (
         f"{warning}"
+        f"{_review_section(task.review_reasons)}"
         f"## Security Fix: {task.title}\n\n"
         f"**Alert:** `{task.alert_id}`  |  "
         f"**Risk:** {task.risk_level}  |  "
@@ -577,12 +681,43 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
         f"{steps_md}{concerns_md}\n\n"
         f"---\n*Auto-generated by `/security-engineer` orchestrator*"
     )
-    pr_title = f"fix(security): {task.title[:60]} [{task.alert_id}]"
 
     # Covers the impact model's prose and the fix agent's own diff_summary in one
     # pass, before the body reaches GitHub and the watch notifications it sends.
-    pr_body = redactor(pr_body)
-    pr_title = redactor(pr_title)
+    return redactor(pr_body)
+
+
+def _sync_pr_body(task: AlertTask) -> None:
+    """Republish the PR body when a post-PR gate changed what it should say.
+
+    This is a second call and it can fail like any other. What it cannot do is
+    fail *because the repo never defined a label* — the one failure mode the body
+    exists to survive. A no-op when nothing changed, so the common path costs
+    nothing.
+    """
+    if not task.pr_url or not task.pr_body:
+        return
+    body = _build_pr_body(task, task.impact)
+    if body == task.pr_body:
+        return
+    r = subprocess.run(["gh", "pr", "edit", task.pr_url, "--body", body],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[WARN] could not update PR body with review reasons: {r.stderr[:200]}")
+        return
+    task.pr_body = body
+
+
+def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) -> str | None:
+    """Stage, commit, and open PR. Returns PR URL or None (dry-run)."""
+    if dry_run:
+        print(f"  [dry-run] would commit and open PR for {task.alert_id}")
+        return None
+
+    redactor = build_redactor(task.alert_json)
+    commit_msg = redactor(f"fix(security): {task.title} ({task.alert_id})")
+    pr_title = redactor(f"fix(security): {task.title[:60]} [{task.alert_id}]")
+    pr_body = _build_pr_body(task, impact)
 
     _run(["python3", _RUN_AGENT, "git-commit", task.alert_id, commit_msg],
          cwd=task.worktree_path)
@@ -596,6 +731,7 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
     pr_url = stdout.strip().split("\n")[-1].strip()
     if not pr_url.startswith("http"):
         raise RuntimeError(f"Unexpected open-pr output: {stdout[:200]}")
+    task.pr_body = pr_body
     return pr_url
 
 
@@ -729,7 +865,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     elif plan.summary:
         print(f"[PLAN]  {task.alert_id} {plan.summary}", flush=True)
     if plan.needs_review:
-        task.needs_review = True
+        detail = plan.error or plan.summary
+        _flag_review(task, f"Fix plan not fully confirmed: {detail}" if detail
+                     else f"The {task.feature_type} pipeline flagged its fix plan for review")
     task.fix_plan = plan
 
     # Fix agent with retries
@@ -806,7 +944,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
         notifier.notify("validation_failed", p)
         return task
     if llm_val.needs_review:
-        task.needs_review = True
+        detail = "; ".join(llm_val.failures)
+        _flag_review(task, f"LLM validation was uncertain: {detail}" if detail
+                     else "LLM validation returned an uncertain verdict")
 
     # Phase 3: the type's own post-fix check. For CVEs this asserts the manifest
     # actually pins the resolved version — the check that never ran, because
@@ -875,7 +1015,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
             )
             if orca_val.passed:
                 if orca_val.needs_review:
-                    task.needs_review = True
+                    detail = "; ".join(orca_val.failures)
+                    _flag_review(task, f"Orca check inconclusive: {detail}" if detail
+                                 else "The Orca check did not return a definitive result")
                 break
 
             # Orca check failed — retry with feedback or handle per config
@@ -938,7 +1080,11 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
             # All retries exhausted
             on_fail = orca_cfg.on_failure
             if on_fail == "skip":
-                task.needs_review = True
+                detail = "; ".join(orca_val.failures)
+                _flag_review(
+                    task,
+                    f"Orca check still failing after {orca_cfg.max_retries + 1} attempts, "
+                    f"continued per config" + (f": {detail}" if detail else ""))
                 print(f"[WARN] {task.alert_id} Orca check failed, skipping per config",
                       flush=True)
                 break
@@ -959,12 +1105,10 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
         if not ci.passed:
             task.state = "CI_FAILED"
             task.failure_reason = "; ".join(ci.failures)
-            r = subprocess.run(
-                ["gh", "pr", "edit", pr_url, "--add-label", "ci-failed"],
-                capture_output=True, text=True
-            )
-            if r.returncode != 0:
-                print(f"[WARN] failed to add ci-failed label: {r.stderr[:200]}")
+            # A red CI is a gate that could not confirm the fix, so it belongs in
+            # the same review marker as the others rather than only on a label.
+            _flag_review(task, f"CI failed on this PR: {task.failure_reason}")
+            _add_label(pr_url, "ci-failed")
             p = _notify_payload(task)
             p.repo = repo.name
             notifier.notify("ci_failed", p)
@@ -973,23 +1117,16 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     else:
         task.state = "DONE"
 
-    # Add needs-review label
-    if task.needs_review and pr_url:
-        r = subprocess.run(
-            ["gh", "pr", "edit", pr_url, "--add-label", "needs-review"],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            print(f"[WARN] failed to add needs-review label: {r.stderr[:200]}")
+    # The body first: it is the copy of the warning that does not depend on the
+    # target repo having been prepared with a label set. The labels are what
+    # makes the PR filterable, and they follow.
+    _sync_pr_body(task)
 
-    # Add impact label
+    if task.needs_review and pr_url:
+        _add_label(pr_url, "needs-review")
+
     if task.impact and pr_url:
-        r = subprocess.run(
-            ["gh", "pr", "edit", pr_url, "--add-label", f"impact:{task.impact.level}"],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            print(f"[WARN] failed to add impact label: {r.stderr[:200]}")
+        _add_label(pr_url, f"impact:{task.impact.level}")
 
     p = _notify_payload(task)
     p.repo = repo.name

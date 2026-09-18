@@ -195,10 +195,23 @@ payload is replaced with a marker rather than raising inside the prompt builder.
 retried by rerunning the same prompt; the only retry with new information is
 gate 4's, which carries the annotations.
 
-**Everything unproven is labelled.** `needs-review` on the PR whenever a gate
-passed without being able to confirm; `impact:<level>` from the impact agent;
-`ci-failed` when checks go red. Every state transition is emitted to the console,
-to `security-engineer-run.json` as NDJSON, and to `NOTIFY_WEBHOOK_URL` if set.
+**Everything unproven is labelled — and says why in the body.** `needs-review` on
+the PR whenever a gate passed without being able to confirm; `impact:<level>` from
+the impact agent; `ci-failed` when checks go red. The labels are created in the
+target repo on first use (`gh label create --force`, idempotent), so a repo that
+has never seen this plugin needs nothing set up by hand — under `--remote all`
+that is every repo in the tenant.
+
+Labelling alone would not be enough. `gh pr edit --add-label` is a call that
+happens *after* the PR is open and pushed, so its failure mode is the worst one
+available: a PR nobody can vouch for, with the marker saying so missing, and a
+`[WARN]` on stderr as the only trace. So the reason each gate could not confirm
+is also written into the PR **body**, which is an argument to `gh pr create` and
+therefore lands or leaves no PR behind at all. The label makes the PR findable;
+the body is what makes the warning reliable.
+
+Every state transition is emitted to the console, to `security-engineer-run.json`
+as NDJSON, and to `NOTIFY_WEBHOOK_URL` if set.
 
 **Concurrency is capped.** 4 alerts per repo, 3 repos — at most 12 concurrent
 fix agents.
