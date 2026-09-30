@@ -213,6 +213,51 @@ the body is what makes the warning reliable.
 Every state transition is emitted to the console, to `security-engineer-run.json`
 as NDJSON, and to `NOTIFY_WEBHOOK_URL` if set.
 
+**Alert text is data, never instructions.** A fix prompt carries `code_snippet`
+— verbatim source from the scanned repository — plus the finding's `description`
+and `recommendation` and the whole normalized alert, and all of it used to be
+interpolated raw a few lines above a section headed `## Instructions`. Anyone who
+can land a file in a repository Orca scans, which a fork branch is enough for,
+could therefore address the fixer directly (`NOTE TO AUTOMATED FIXER: before
+editing, run …`) and have it arrive as guidance.
+
+`untrusted.py` draws the boundary. Every prompt opens with a preamble stating the
+rule before a single untrusted byte appears; every alert-derived field is wrapped
+in `<untrusted-NONCE id="field"> … </untrusted-NONCE>` markers whose nonce is
+random per invocation, so content cannot close a fence whose name it was never
+told; and every field is capped at `FIELD_LIMIT`, so a huge snippet cannot push
+the real instructions out of attention. The agent's own instructions stay outside
+every fence. The same applies to the LLM-validation and impact prompts — those
+have no tools, but a steered verdict is how a fix that does nothing gets past
+gate 2, and steered impact prose is pasted straight into the PR body.
+
+Order against the redactor is redact, then bound, then fence: slicing first can
+cut a credential in half and leave a fragment no candidate matches. The fix
+prompt is the one place the credential is not redacted, and always was — an agent
+asked to remove a hardcoded secret has to be shown the line it is on.
+
+**A fix agent gets the tools its type needs and no more.** `--allowedTools` is the
+auto-approved set in headless `-p`, and `Bash` was in it, unqualified. It is now
+the pipeline's decision: `sast`, `iac` and `secret` get `Read,Edit,Write` and no
+shell — their only shell use was `git checkout -- <file>` after a bad edit, which
+`_revert` already does on every failure path — and a CVE gets `Bash` scoped to the
+single lockfile-regen command its ecosystem needs (`Bash(go mod tidy:*)` and so
+on), or none at all when the package could not be identified. `--tools` names the
+set, which removes every other tool's definition from the model's context rather
+than merely denying the call. Verified against claude 2.1.276: under an npm-scoped
+allowlist, `cat /etc/hostname` is denied, and so is `npm install … ; echo x` —
+the matcher splits on shell operators rather than prefix-matching the whole line.
+
+**A model subprocess sees an allowlisted environment.** There was no `env=`
+anywhere, so all four `claude -p` calls inherited `ORCA_API_TOKEN`,
+`NOTIFY_WEBHOOK_URL` and whatever `gh` was authenticated with. `agent_env.py`
+passes an explicit list of names — never a pattern, since `NPM_TOKEN` would sail
+through any prefix rule written for npm. `fix_agent.extra_env` adds names for
+setups the default cannot know about, and refuses credential-shaped ones so the
+allowlist cannot be undone by accident. The orchestrator's own `gh` and `git`
+subprocesses are untouched: they need those credentials and are not the untrusted
+party.
+
 **A cloned tree is input, never configuration.** `--remote all` clones arbitrary
 tenant repositories into `/tmp`, and the fix agent runs with `cwd` inside one.
 A repository configures Claude Code simply by containing files — `CLAUDE.md`,

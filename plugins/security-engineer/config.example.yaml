@@ -62,6 +62,25 @@ version_data:
   osv_url: ""                   # empty means the upstream default
   deps_dev_url: ""
 
+# The fix agent subprocess. It runs with an explicit environment allowlist, not
+# the orchestrator's own environment: it reads repository content, which anyone
+# who can land a file in a scanned repo can write, so it is not given
+# ORCA_API_TOKEN, NOTIFY_WEBHOOK_URL or the gh credentials.
+#
+# The default allowlist covers PATH/HOME, TLS and proxy settings, Claude's own
+# auth, and the toolchain *cache* variables the CVE lockfile regens need. It
+# deliberately leaves out anything that can carry a credential inside a URL —
+# GOPROXY, GOPRIVATE, NPM_CONFIG_REGISTRY, PIP_INDEX_URL — so a private-registry
+# setup opts in here rather than getting them by default.
+#
+# Only names are listed; values still come from the real environment, so this
+# file never holds a secret. Names that look like credentials are refused with a
+# warning, which is why the allowlist cannot be undone by accident.
+fix_agent:
+  extra_env: []
+  # e.g. a Bedrock deployment, or a private Go module proxy:
+  # extra_env: ["AWS_REGION", "AWS_PROFILE", "GOPROXY"]
+
 # Concurrency caps. At most max_parallel_repos x max_parallel_fixes Claude
 # subprocesses run at once, so the defaults below allow 12.
 max_parallel_fixes: 4

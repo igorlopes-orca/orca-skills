@@ -10,7 +10,9 @@ import subprocess
 from dataclasses import dataclass, field
 
 from _json_util import find_last_json_with_key
+from agent_env import agent_env
 from redact import build_redactor
+from untrusted import bound, bound_strings, fence, new_nonce, preamble
 from validator import (
     _SINGLE_SHOT_CONTRACT,
     _SINGLE_SHOT_MAX_TURNS,
@@ -33,13 +35,12 @@ class ImpactResult:
 _PROMPT = """\
 You are assessing the production risk of a security fix before it is deployed.
 
+{untrusted_preamble}
 ## Alert Details
 {alert_json}
 {fix_context}
 ## Git Diff
-```diff
 {diff_text}
-```
 
 Analyze the diff in the context of the vulnerability and answer:
 1. What is the production risk of deploying this change?
@@ -135,10 +136,15 @@ def analyze_impact(
                  Facts the model would otherwise have to infer from the diff.
     """
     redactor = build_redactor(alert_json)
+    # The description and concerns this returns are pasted verbatim into the PR
+    # body, so a model steered by repository content writes into our pull request.
+    nonce = new_nonce()
     prompt = _PROMPT.format(
-        alert_json=json.dumps(alert_json, indent=2),
-        diff_text=redactor(diff_text)[:6000],
-        fix_context=_render_fix_context(fix_context),
+        untrusted_preamble=preamble(nonce),
+        alert_json=fence("alert_json",
+                         json.dumps(bound_strings(alert_json), indent=2), nonce),
+        diff_text=fence("diff", bound(redactor(diff_text), 6000), nonce),
+        fix_context=fence("fix_context", bound(_render_fix_context(fix_context)), nonce),
         contract=_SINGLE_SHOT_CONTRACT,
     )
     # alert_json and fix_context are in here too, and for a secret finding the
@@ -154,7 +160,8 @@ def analyze_impact(
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_sec
+            cmd, capture_output=True, text=True, timeout=timeout_sec,
+            env=agent_env(),
         )
     except subprocess.TimeoutExpired:
         print(f"[WARN] impact analysis timed out after {timeout_sec}s")

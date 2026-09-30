@@ -11,7 +11,9 @@ Your branch is already set up. Follow these steps:
 2. **Apply the fix** — replace the hardcoded value with an environment variable reference.
    Use `code_snippet` to locate the exact line. Fix all occurrences across files.
 
-3. **Verify** — Read the file again. If unchanged, run `git checkout -- <file>`, output the failure JSON, and stop.
+3. **Verify** — Read the file again. If unchanged, output the failure JSON and stop.
+   Do not try to undo the edit yourself — the orchestrator reverts the worktree on
+   every failure path.
 
 4. **Output** the required JSON below as your very last output (nothing after it).
 

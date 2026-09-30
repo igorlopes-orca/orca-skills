@@ -974,6 +974,7 @@ class TestSingleShotContract(unittest.TestCase):
         import impact_agent
         from validator import _SINGLE_SHOT_CONTRACT
         rendered = impact_agent._PROMPT.format(
+            untrusted_preamble=impact_agent.preamble("n"),
             alert_json="{}", diff_text="d",
             fix_context=impact_agent._render_fix_context(_DECISION),
             contract=_SINGLE_SHOT_CONTRACT)

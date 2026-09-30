@@ -17,7 +17,8 @@ The alert data and your branch are already set up. Follow these steps:
    - `labels` — CWE/OWASP context
 
 3. **Verify** — Read the file again. Confirm the change is present and correct.
-   If unchanged or wrong: run `git checkout -- <file>`, then output the failure JSON and stop.
+   If unchanged or wrong: output the failure JSON and stop. Do not try to undo the
+   edit yourself — the orchestrator reverts the worktree on every failure path.
 
 4. **Output** the required JSON below as your very last output (nothing after it).
 

@@ -24,6 +24,7 @@ sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
 from _json_util import find_last_json_with_key
+from agent_env import agent_env
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
 from notifier import NotificationPayload, build_notifiers
@@ -47,6 +48,7 @@ from paths import (
 )
 from pipelines import FixPlan, get_pipeline
 from redact import build_redactor
+from untrusted import bound, bound_strings, fence, new_nonce, preamble
 from validator import (
     _parse_pr_url,
     ci_gate,
@@ -277,9 +279,12 @@ def _get_diff(worktree_path: Path) -> str:
 _FIX_PROMPT_LIVE = """\
 You are a specialist security fix agent. Fix ONE specific vulnerability.
 
+{untrusted_preamble}
 ## Vulnerability
 **Alert:** {alert_id}  |  **Severity:** {risk_level}  |  **Type:** {feature_type}
-**Title:** {title}
+
+**Title:**
+{title}
 
 ## Location
 **File:** {file_path}
@@ -325,9 +330,12 @@ DRY RUN — read files only, do not edit anything.
 
 You are reviewing what a fix would look like for this vulnerability.
 
+{untrusted_preamble}
 ## Vulnerability
 **Alert:** {alert_id}  |  **Severity:** {risk_level}  |  **Type:** {feature_type}
-**Title:** {title}
+
+**Title:**
+{title}
 
 ## Location
 **File:** {file_path}
@@ -359,8 +367,20 @@ Print ONLY this JSON as your very last output:
 """
 
 
-def _build_prompt_context(alert: dict) -> dict:
-    """Extract structured fields from alert JSON for fix agent prompts."""
+# A path is used as a path — "Read the file at {file_path}" — so fencing it would
+# break the sentence it sits in. Bounding it is what stops it being a paragraph.
+_PATH_LIMIT = 512
+
+
+def _build_prompt_context(alert: dict, nonce: str) -> dict:
+    """Extract structured fields from alert JSON for fix agent prompts.
+
+    Every value here came from the scanned repository or the finding, so every
+    value leaves fenced and bounded — see untrusted.py. The two that do not are
+    the ones used structurally rather than read as prose: file_path, which the
+    agent is told to open, and lines, which this function builds itself from two
+    integers.
+    """
     position = alert.get("position", {}) or {}
     start_line = position.get("start_line")
     end_line = position.get("end_line")
@@ -381,12 +401,16 @@ def _build_prompt_context(alert: dict) -> dict:
     ai_explanation = ai_triage.get("explanation", "")
 
     return {
-        "file_path":            alert.get("file_path") or alert.get("source", "(unknown)"),
-        "lines":                lines,
-        "code_snippet":         code_snippet,
-        "description":          alert.get("description", ""),
-        "ai_triage_explanation": ai_explanation,
-        "recommendation":       alert.get("recommendation", ""),
+        "file_path":  bound(alert.get("file_path") or alert.get("source", "(unknown)"),
+                            _PATH_LIMIT),
+        "lines":      lines,
+        "code_snippet":          fence("code_snippet", bound(code_snippet), nonce),
+        "description":           fence("description", bound(alert.get("description", "")),
+                                       nonce),
+        "ai_triage_explanation": fence("ai_triage_explanation", bound(ai_explanation),
+                                       nonce),
+        "recommendation":        fence("recommendation",
+                                       bound(alert.get("recommendation", "")), nonce),
     }
 
 
@@ -401,12 +425,18 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
         )
     instructions = instructions_path.read_text()
 
+    # The pipeline decides what this type of fix is allowed to touch. sast, iac
+    # and secret get no shell at all; a CVE gets the one regen command its
+    # ecosystem needs, and nothing when we could not identify one.
+    pipeline = get_pipeline(task.feature_type, timeouts=TIMEOUTS)
     if dry_run:
         tmpl = _FIX_PROMPT_DRY
-        tools = "Read"
+        tools = ["Read"]
+        allowed = ["Read"]
     else:
         tmpl = _FIX_PROMPT_LIVE
-        tools = "Read,Edit,Write,Bash"
+        tools = pipeline.agent_tools(task.fix_plan)
+        allowed = [t for t in tools if t != "Bash"] + pipeline.bash_allowlist(task.fix_plan)
 
     # A specialist's directive goes after the type instructions and before the
     # alert dump, so the concrete decision is the last thing read as guidance
@@ -414,12 +444,17 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
     if task.fix_plan and task.fix_plan.prompt_extra:
         instructions = f"{instructions}\n\n---\n\n{task.fix_plan.prompt_extra}"
 
-    ctx = _build_prompt_context(task.alert_json)
+    # One nonce per invocation, shared by every fence in this prompt, so alert
+    # content cannot close a fence it was never told the name of.
+    nonce = new_nonce()
+    ctx = _build_prompt_context(task.alert_json, nonce)
     prompt = tmpl.format(
-        alert_json=json.dumps(task.alert_json, indent=2),
+        untrusted_preamble=preamble(nonce),
+        alert_json=fence("alert_json",
+                         json.dumps(bound_strings(task.alert_json), indent=2), nonce),
         instructions=instructions,
         alert_id=task.alert_id,
-        title=task.title,
+        title=fence("title", bound(task.title), nonce),
         risk_level=task.risk_level,
         feature_type=task.feature_type,
         **ctx,
@@ -430,7 +465,9 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
             "\n\n## Previous Attempt Failed\n\n"
             "Your previous fix introduced new security findings detected by "
             "the Orca security check on the PR:\n\n"
-            f"{feedback}\n\n"
+            # Annotations quote the lines they flag, so this is repository
+            # content arriving back through the Orca check.
+            f"{fence('orca_check_findings', bound(feedback), nonce)}\n\n"
             "Each finding includes the file, line number, and description of the issue.\n"
             "Read the affected files, understand why your fix introduced these problems, "
             "and apply a different approach that resolves the original vulnerability "
@@ -442,7 +479,12 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
     cmd = [
         "claude", "-p", prompt,
         *_PINNED_CONFIG_FLAGS,
-        "--allowedTools", tools,
+        # --tools removes the definitions of everything else from the model's
+        # context; --allowedTools is the auto-approved set within what is left.
+        # See validator._SINGLE_SHOT_TOOL_FLAGS for why the first is the one
+        # that does the work.
+        "--tools", ",".join(tools),
+        "--allowedTools", *allowed,
         "--output-format", "json",
         "--max-turns", "20",
     ]
@@ -452,6 +494,7 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
             cmd, capture_output=True, text=True,
             timeout=timeout_sec,
             cwd=task.worktree_path,
+            env=agent_env(),
         )
     except subprocess.TimeoutExpired:
         return FixAgentResult(
