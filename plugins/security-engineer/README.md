@@ -29,6 +29,13 @@ only onto the label. The labels it uses (`needs-review`, `ci-failed`,
 `impact:<level>`) are created in the target repo on first use, so there is
 nothing to pre-create.
 
+The fix agent is deliberately narrow: alert text reaches it fenced as data rather
+than as instructions, its tools are scoped per finding type (only a CVE gets a
+shell, and only for its ecosystem's lockfile command), and it runs with an
+allowlisted environment that excludes the Orca token and the webhook URL. A
+private registry or a Bedrock deployment adds what it needs through
+`fix_agent.extra_env` — see [`config.example.yaml`](config.example.yaml).
+
 **How and why it holds together — the gates, the data sources, what fails open
 and what fails closed: [`HARNESS.md`](HARNESS.md).**
 

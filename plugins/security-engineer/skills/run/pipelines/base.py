@@ -57,6 +57,24 @@ class FixPipeline:
         self.timeout_sec = timeout_sec
         self.diff_limit = diff_limit
 
+    # The tools a fix agent of this type gets. No Bash: sast, iac and secret
+    # reach for a shell exactly once, to `git checkout -- <file>` after a bad
+    # edit, and orchestrator._revert already does that more thoroughly on every
+    # failure path. A type that genuinely needs one says so by overriding.
+    AGENT_TOOLS = ["Read", "Edit", "Write"]
+
+    def agent_tools(self, plan: FixPlan | None = None) -> list[str]:
+        """Tool names for `--tools`, which removes the rest from the model's context."""
+        return list(self.AGENT_TOOLS)
+
+    def bash_allowlist(self, plan: FixPlan | None = None) -> list[str]:
+        """Permission patterns for `--allowedTools`, e.g. `Bash(go mod tidy:*)`.
+
+        Empty means the agent has no shell at all. Non-empty entries are matched
+        per command segment — a chained `allowed ; something-else` does not pass.
+        """
+        return []
+
     def prepare(self, task, worktree_path: Path) -> FixPlan:
         """Nothing to work out ahead of time."""
         return FixPlan()

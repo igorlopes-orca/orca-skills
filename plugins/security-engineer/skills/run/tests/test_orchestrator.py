@@ -689,6 +689,15 @@ class TestFeatureTypeResolution(unittest.TestCase):
 # 5. Dry-run enforcement
 # ---------------------------------------------------------------------------
 
+def _flag_values(cmd: list, flag: str) -> list:
+    """Every value after `flag` up to the next one. --allowedTools is variadic."""
+    start = cmd.index(flag) + 1
+    end = start
+    while end < len(cmd) and not str(cmd[end]).startswith("--"):
+        end += 1
+    return list(cmd[start:end])
+
+
 class TestDryRunEnforcement(unittest.TestCase):
 
     def _make_task(self, alert_id="orca-test-001", feature_type="sast"):
@@ -728,8 +737,9 @@ class TestDryRunEnforcement(unittest.TestCase):
         self.assertEqual(tools_value, "Read",
                          f"dry-run must use 'Read' only, got: {tools_value}")
 
-    def test_live_mode_uses_full_tools(self):
-        """In live mode, claude subprocess must receive Read,Edit,Write,Bash."""
+    def test_live_mode_can_edit_but_gets_no_shell(self):
+        """A sast fix edits files. It has never needed a shell for anything but
+        `git checkout -- <file>`, which _revert already does, so it gets none."""
         task = self._make_task()
 
         with patch("subprocess.run") as mock_run:
@@ -747,11 +757,11 @@ class TestDryRunEnforcement(unittest.TestCase):
         self.assertTrue(len(claude_calls) > 0)
 
         cmd = claude_calls[0].args[0]
-        allowed_tools_idx = cmd.index("--allowedTools")
-        tools_value = cmd[allowed_tools_idx + 1]
-        self.assertIn("Edit", tools_value)
-        self.assertIn("Write", tools_value)
-        self.assertIn("Bash", tools_value)
+        tools = cmd[cmd.index("--tools") + 1]
+        self.assertEqual(tools, "Read,Edit,Write")
+        allowed = _flag_values(cmd, "--allowedTools")
+        self.assertEqual(allowed, ["Read", "Edit", "Write"])
+        self.assertNotIn("Bash", ",".join(allowed))
 
     def test_dry_run_commit_and_pr_is_noop(self):
         """_commit_and_pr must not run any git or gh commands in dry-run mode."""
@@ -1439,11 +1449,20 @@ class TestBuildPromptContext(unittest.TestCase):
             ),
         ]
 
+        # Every alert-derived field now leaves fenced, so the extracted value is
+        # inside the result rather than equal to it. file_path and lines are the
+        # two that are not fenced — one is opened as a path, the other is built
+        # here from two integers — so those stay exact.
+        exact = {"file_path", "lines"}
         for desc, alert, expected in CASES:
             with self.subTest(desc):
-                result = _build_prompt_context(alert)
+                result = _build_prompt_context(alert, "testnonce")
                 for key, val in expected.items():
-                    self.assertEqual(result[key], val, f"{desc}: {key}")
+                    if key in exact:
+                        self.assertEqual(result[key], val, f"{desc}: {key}")
+                    else:
+                        self.assertIn(val, result[key], f"{desc}: {key}")
+                        self.assertIn("untrusted-testnonce", result[key], f"{desc}: {key}")
 
 
 # ---------------------------------------------------------------------------

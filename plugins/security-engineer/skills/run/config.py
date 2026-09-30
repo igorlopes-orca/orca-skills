@@ -52,9 +52,29 @@ class VersionDataConfig:
 
 
 @dataclass
+class FixAgentConfig:
+    """Controls the environment the fix agent subprocess is given.
+
+    The agent runs with an explicit environment allowlist (orchestrator._agent_env),
+    not the orchestrator's own: it has no legitimate use for ORCA_API_TOKEN or
+    NOTIFY_WEBHOOK_URL, and a process that reads repository content should not be
+    holding them.
+
+    extra_env names variables to add to that allowlist, for setups the default
+    cannot know about — a Bedrock or Vertex deployment needing AWS_REGION, a
+    private registry needing GOPROXY or NPM_CONFIG_REGISTRY. Only names are
+    configured; values still come from the real environment, so a config file
+    never holds a secret. Names that look like credentials are refused, so this
+    cannot quietly undo the allowlist.
+    """
+    extra_env: list = field(default_factory=list)
+
+
+@dataclass
 class Config:
     orca_check: OrcaCheckConfig = field(default_factory=OrcaCheckConfig)
     version_data: VersionDataConfig = field(default_factory=VersionDataConfig)
+    fix_agent: FixAgentConfig = field(default_factory=FixAgentConfig)
     max_parallel_fixes: int = 4
     max_parallel_repos: int = 3
 
@@ -65,6 +85,7 @@ class Config:
 _SECTIONS = {
     "orca_check": OrcaCheckConfig,
     "version_data": VersionDataConfig,
+    "fix_agent": FixAgentConfig,
 }
 
 

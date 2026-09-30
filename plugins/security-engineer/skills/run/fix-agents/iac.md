@@ -11,7 +11,9 @@ Your branch is already set up. Follow these steps:
 
 2. **Apply the fix** using the patterns below, guided by `recommendation` and `code_snippet`.
 
-3. **Verify** — Read the file again. If unchanged or wrong, run `git checkout -- <file>`, output the failure JSON, and stop.
+3. **Verify** — Read the file again. If unchanged or wrong, output the failure JSON and
+   stop. Do not try to undo the edit yourself — the orchestrator reverts the worktree
+   on every failure path.
 
 4. **Output** the required JSON below as your very last output (nothing after it).
 

@@ -20,9 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
+from agent_env import agent_env
 from orca_client import _resolve_feature_type
 from paths import resolve_within
 from redact import build_redactor
+from untrusted import bound, bound_strings, fence, new_nonce, preamble
 
 
 @dataclass
@@ -258,13 +260,12 @@ def sanity_check(alert: dict, worktree_path: Path,
 _LLM_PROMPT = """\
 You are reviewing a security fix diff. Does this fix correctly address the vulnerability?
 
+{untrusted_preamble}
 ## Alert
 {alert_json}
 
 ## Diff Applied
-```diff
 {diff_text}
-```
 
 {contract}
 Return ONLY this JSON, with nothing before or after it:
@@ -284,11 +285,18 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
     redactor = build_redactor(alert)
     # Redact before truncating, not after: slicing first can cut a credential in
     # half and leave a fragment no candidate matches.
-    diff_text = redactor(worktree_diff(worktree_path))[:5000]
+    diff_text = bound(redactor(worktree_diff(worktree_path)), 5000)
 
+    # Both halves are repository content: alert_json carries code_snippet, and a
+    # diff is the file it came from. A verdict is worth steering — "pass" here is
+    # how a fix that does nothing gets past gate 2 — so the boundary is stated
+    # even though this subprocess has no tools to be steered into using.
+    nonce = new_nonce()
     prompt = _LLM_PROMPT.format(
-        alert_json=json.dumps(alert, indent=2),
-        diff_text=diff_text,
+        untrusted_preamble=preamble(nonce),
+        alert_json=fence("alert_json",
+                         json.dumps(bound_strings(alert), indent=2), nonce),
+        diff_text=fence("diff", diff_text, nonce),
         contract=_SINGLE_SHOT_CONTRACT,
     )
     # The whole prompt, not just the diff: alert_json carries code_snippet, which
@@ -298,7 +306,8 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] LLM validation timed out after {timeout_sec}s")
         return ValidationResult(passed=True, phase="llm", needs_review=True,

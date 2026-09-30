@@ -76,6 +76,51 @@ class CvePipeline(FixPipeline):
         self.fetcher = fetcher
         self.allow_llm_identify = allow_llm_identify
 
+    # -- what the agent is allowed to run -----------------------------------
+
+    # A manifest bump is an edit, but several ecosystems keep a lockfile that
+    # only their own tool can regenerate consistently. These are the commands
+    # the fix-agents/cve/*.md fragments already prescribe, and nothing else —
+    # the agent gets the one command its ecosystem needs, not a shell.
+    #
+    # pypi and maven are absent deliberately: their fragments prescribe no
+    # command, so a CVE in either gets no Bash, exactly like a sast finding.
+    REGEN_COMMANDS = {
+        "npm":      ["npm install --package-lock-only --ignore-scripts"],
+        "go":       ["go get", "go mod tidy"],
+        "cargo":    ["cargo update"],
+        "rubygems": ["bundle lock --update"],
+        "nuget":    ["dotnet restore"],
+    }
+
+    @staticmethod
+    def _plan_ecosystem(plan) -> str:
+        """The ecosystem `prepare` resolved, or "" if it could not.
+
+        Named apart from _ecosystem, which resolves an Ecosystem object from a
+        package_ref — this one only needs the key, and needs it to be "" rather
+        than None when identification failed.
+        """
+        ref = (plan.metadata.get("package_ref") if (plan and plan.metadata) else None) or {}
+        return (ref.get("ecosystem") or "").lower()
+
+    def agent_tools(self, plan=None) -> list[str]:
+        """Bash only when this alert's ecosystem has a lockfile to regenerate.
+
+        `prepare` has already run by the time the prompt is built, so the
+        ecosystem is known. An alert we could not identify gets no shell — the
+        unguided fallback fix edits the manifest and is flagged needs-review
+        anyway, and handing it a shell on the way would be backwards.
+        """
+        tools = list(self.AGENT_TOOLS)
+        if self.bash_allowlist(plan):
+            tools.append("Bash")
+        return tools
+
+    def bash_allowlist(self, plan=None) -> list[str]:
+        commands = self.REGEN_COMMANDS.get(self._plan_ecosystem(plan), [])
+        return [f"Bash({command}:*)" for command in commands]
+
     # -- before the agent runs ----------------------------------------------
 
     def prepare(self, task, worktree_path: Path) -> FixPlan:

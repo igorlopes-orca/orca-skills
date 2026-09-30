@@ -22,7 +22,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 from _json_util import find_last_json_with_key
+from agent_env import agent_env
 from paths import resolve_within
+from untrusted import bound, fence, new_nonce, preamble
 from validator import _SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS, _subprocess_error_detail
 from version_data import Ecosystem, ecosystem_for_manifest
 
@@ -530,10 +532,14 @@ def _version_from_lockfile(manifest_abs: Path, name: str,
 _LLM_PROMPT = """\
 An automated security pipeline needs to know which dependency an alert is about.
 
+{untrusted_preamble}
 ## Alert
-Title: {title}
-Description: {description}
-Recommendation: {recommendation}
+Title:
+{title}
+Description:
+{description}
+Recommendation:
+{recommendation}
 CVE ids: {cve_ids}
 
 ## Dependencies declared in {manifest}
@@ -559,19 +565,25 @@ def _match_from_llm(alert: dict, deps: dict, ecosystem: Ecosystem,
     """
     listing = "\n".join(f"- {d.name} ({d.spec or 'no version'})"
                         for d in deps.values())
+    # Everything but the manifest path and the dependency listing came from the
+    # finding. The listing is ours — read out of the manifest by read_manifest —
+    # but it is repository content all the same.
+    nonce = new_nonce()
     prompt = _LLM_PROMPT.format(
-        title=alert.get("title", ""),
-        description=(alert.get("description") or "")[:1500],
-        recommendation=(alert.get("recommendation") or "")[:1500],
+        untrusted_preamble=preamble(nonce),
+        title=fence("title", bound(alert.get("title", ""), 500), nonce),
+        description=fence("description", bound(alert.get("description") or "", 1500), nonce),
+        recommendation=fence("recommendation",
+                             bound(alert.get("recommendation") or "", 1500), nonce),
         cve_ids=", ".join(cve_ids_from_alert(alert)) or "(none)",
         manifest=manifest_rel,
-        dep_list=listing[:4000],
+        dep_list=fence("dependencies", bound(listing, 4000), nonce),
     )
     cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=timeout_sec)
+                                timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] package identification timed out after {timeout_sec}s",
               flush=True)
