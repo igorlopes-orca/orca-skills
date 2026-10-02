@@ -711,7 +711,7 @@ class TestOrchestratorUsesThePipeline(unittest.TestCase):
                 stderr="")
             task.worktree_path = Path("/tmp/wt")
             orchestrator._invoke_fix_agent(task, dry_run=False, timeout_sec=10)
-        prompt = mock_run.call_args[0][0][2]
+        prompt = mock_run.call_args.kwargs["input"]
         self.assertIn("SET pillow TO 10.0.1", prompt)
 
     def test_prompt_is_unchanged_without_a_plan(self):
@@ -726,7 +726,7 @@ class TestOrchestratorUsesThePipeline(unittest.TestCase):
                 stderr="")
             task.worktree_path = Path("/tmp/wt")
             orchestrator._invoke_fix_agent(task, dry_run=False, timeout_sec=10)
-        prompt = mock_run.call_args[0][0][2]
+        prompt = mock_run.call_args.kwargs["input"]
         self.assertNotIn("---\n\n", prompt.split("## Full Alert Data")[0][-40:])
 
 
@@ -903,7 +903,7 @@ class TestImpactFixContext(unittest.TestCase):
                      "requires_deploy": False})}),
                 stderr="")
             impact_agent.analyze_impact({"alert_id": "a"}, "diff")
-        prompt = mock_run.call_args[0][0][2]
+        prompt = mock_run.call_args.kwargs["input"]
         self.assertNotIn("Fix Context", prompt)
 
     def test_prompt_includes_the_section_when_given(self):
@@ -917,7 +917,7 @@ class TestImpactFixContext(unittest.TestCase):
                 stderr="")
             impact_agent.analyze_impact({"alert_id": "a"}, "diff",
                                         fix_context=_DECISION)
-        prompt = mock_run.call_args[0][0][2]
+        prompt = mock_run.call_args.kwargs["input"]
         self.assertIn("Fix Context", prompt)
         self.assertIn("crossing 4 major versions", prompt)
 

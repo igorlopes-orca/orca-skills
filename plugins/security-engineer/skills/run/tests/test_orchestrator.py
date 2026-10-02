@@ -1721,7 +1721,7 @@ class TestOrcaCheckRetry(unittest.TestCase):
 
         _invoke_fix_agent(task, dry_run=False, timeout_sec=60, feedback=feedback)
 
-        prompt_arg = mock_run.call_args[0][0][2]  # cmd[2] is the prompt
+        prompt_arg = mock_run.call_args.kwargs["input"]  # cmd[2] is the prompt
         self.assertIn("Previous Attempt Failed", prompt_arg)
         self.assertIn("Orca security check", prompt_arg)
         self.assertIn(feedback, prompt_arg)

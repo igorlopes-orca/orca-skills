@@ -577,7 +577,7 @@ class TestIdentifyPackageLlmFallback(_TreeCase):
         with patch("package_identity.subprocess.run",
                    return_value=self._claude("pillow")) as run:
             identify_package(self.alert, self.root, allow_llm=True)
-        prompt = run.call_args[0][0][2]
+        prompt = run.call_args.kwargs["input"]
         for name in ("pillow", "numpy", "flask"):
             self.assertIn(name, prompt)
 
