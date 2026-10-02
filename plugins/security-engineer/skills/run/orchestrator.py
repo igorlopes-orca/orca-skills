@@ -476,8 +476,14 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
             "alternative approach."
         )
 
+    # The prompt goes in on stdin, never in argv. `claude -p <prompt>` puts the
+    # whole thing on the command line, where any local user reads it via
+    # `ps -efww` or /proc/<pid>/cmdline, and where process-exec audit logs and
+    # EDR telemetry record it by default. For a secret finding that text is the
+    # credential itself. This closes the local copy; the API call is still
+    # governed by redact.py.
     cmd = [
-        "claude", "-p", prompt,
+        "claude", "-p",
         *_PINNED_CONFIG_FLAGS,
         # --tools removes the definitions of everything else from the model's
         # context; --allowedTools is the auto-approved set within what is left.
@@ -491,7 +497,7 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True,
             timeout=timeout_sec,
             cwd=task.worktree_path,
             env=agent_env(),

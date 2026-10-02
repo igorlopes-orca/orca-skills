@@ -579,10 +579,11 @@ def _match_from_llm(alert: dict, deps: dict, ecosystem: Ecosystem,
         manifest=manifest_rel,
         dep_list=fence("dependencies", bound(listing, 4000), nonce),
     )
-    cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
+    # stdin, not argv — see orchestrator._invoke_fix_agent.
+    cmd = ["claude", "-p", *_SINGLE_SHOT_TOOL_FLAGS,
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                                 timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] package identification timed out after {timeout_sec}s",

@@ -183,7 +183,7 @@ class TestFencingDoesNotBreakRedaction(unittest.TestCase):
             run.return_value = MagicMock(returncode=0, stdout='{"verdict": "pass"}',
                                          stderr="")
             validator.llm_validate(self.ALERT, Path("/tmp/orca-fix-x"))
-        prompt = run.call_args_list[0].args[0][2]
+        prompt = run.call_args_list[0].kwargs["input"]
         self.assertNotIn(self.VALUE, prompt)
         self.assertIn("untrusted-", prompt)
 
@@ -195,7 +195,7 @@ class TestFencingDoesNotBreakRedaction(unittest.TestCase):
                        ' "requires_deploy": false, "concerns": [], "manual_steps": []}',
                 stderr="")
             impact_agent.analyze_impact(self.ALERT, f'-API_KEY = "{self.VALUE}"')
-        prompt = run.call_args_list[0].args[0][2]
+        prompt = run.call_args_list[0].kwargs["input"]
         self.assertNotIn(self.VALUE, prompt)
         self.assertIn("untrusted-", prompt)
 
@@ -210,7 +210,7 @@ class TestFencingDoesNotBreakRedaction(unittest.TestCase):
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# instructions"):
                 _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
-        prompt = run.call_args_list[0].args[0][2]
+        prompt = run.call_args_list[0].kwargs["input"]
         self.assertIn(self.VALUE, prompt)
         # and it is inside a fence, like every other alert-derived field
         tag = prompt.split("untrusted-")[1].split(" ")[0].split(">")[0]
@@ -365,7 +365,7 @@ class TestInjectionShapeEndToEnd(unittest.TestCase):
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# instructions"):
                 _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
-        prompt = run.call_args_list[0].args[0][2]
+        prompt = run.call_args_list[0].kwargs["input"]
 
         self.assertIn(INJECTION, prompt)          # still shown — it is the finding
         tag = prompt.split("untrusted-")[1].split(" ")[0].split(">")[0]
@@ -382,6 +382,127 @@ class TestInjectionShapeEndToEnd(unittest.TestCase):
         self.assertIn('fence("alert_json"', inspect.getsource(impact_agent.analyze_impact))
 
 
+
+class TestPromptNeverReachesArgv(unittest.TestCase):
+    """`claude -p <prompt>` puts the prompt on the command line, where any local
+    user reads it via `ps -efww` or /proc/<pid>/cmdline, and where process-exec
+    audit logs and EDR telemetry record it by default.
+
+    The content is what makes it matter: for a secret finding the fix prompt is
+    the credential, and the validation diff is the credential being removed.
+    This covers the local copy only — the API call is still redact.py's job.
+    """
+
+    MARKER = "UNIQUE-PROMPT-MARKER-91f2"
+
+    def _fix_agent(self):
+        alert = {"alert_id": "orca-1", "feature_type": "sast", "file_path": "app.py",
+                 "position": {}, "code_snippet": [self.MARKER],
+                 "description": "", "recommendation": ""}
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json=alert,
+                         worktree_path=Path("/tmp/orca-fix-x"))
+        with patch("subprocess.run") as run:
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
+            with patch.object(Path, "exists", return_value=True), \
+                 patch.object(Path, "read_text", return_value="# i"):
+                _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
+        return run.call_args_list[0]
+
+    def _llm_validate(self):
+        alert = {"alert_id": "orca-1", "feature_type": "sast",
+                 "description": self.MARKER}
+        with patch.object(validator, "worktree_diff", return_value="-x"), \
+             patch.object(validator.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout='{"verdict": "pass"}',
+                                         stderr="")
+            validator.llm_validate(alert, Path("/tmp/orca-fix-x"))
+        return run.call_args_list[0]
+
+    def _impact(self):
+        alert = {"alert_id": "orca-1", "feature_type": "sast",
+                 "description": self.MARKER}
+        with patch.object(impact_agent.subprocess, "run") as run:
+            run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"level": "low", "description": "d", "downtime_risk": false,'
+                       ' "requires_deploy": false, "concerns": [], "manual_steps": []}',
+                stderr="")
+            impact_agent.analyze_impact(alert, "-x")
+        return run.call_args_list[0]
+
+    def _identify(self):
+        from package_identity import Dependency, _match_from_llm
+        alert = {"title": self.MARKER, "description": "", "recommendation": ""}
+        deps = {"pillow": Dependency(name="pillow", spec="8.3.1")}
+        with patch.object(package_identity.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
+            _match_from_llm(alert, deps, MagicMock(key="pypi"), "requirements.txt", 5)
+        return run.call_args_list[0]
+
+    def _all_sites(self):
+        return [("fix agent", self._fix_agent()),
+                ("llm_validate", self._llm_validate()),
+                ("analyze_impact", self._impact()),
+                ("identify package", self._identify())]
+
+    def test_prompt_is_passed_on_stdin(self):
+        for name, call in self._all_sites():
+            with self.subTest(name):
+                self.assertIn("input", call.kwargs, f"{name} does not use stdin")
+                self.assertIn(self.MARKER, call.kwargs["input"], name)
+
+    def test_prompt_is_absent_from_argv(self):
+        for name, call in self._all_sites():
+            with self.subTest(name):
+                cmd = call.args[0]
+                self.assertNotIn(self.MARKER, " ".join(str(c) for c in cmd), name)
+
+    def test_nothing_positional_follows_dash_p(self):
+        """The slot the prompt used to occupy now holds a flag."""
+        for name, call in self._all_sites():
+            with self.subTest(name):
+                cmd = call.args[0]
+                self.assertEqual(cmd[1], "-p", name)
+                self.assertTrue(str(cmd[2]).startswith("--"),
+                                f"{name}: cmd[2] is {cmd[2]!r}, not a flag")
+
+    def test_a_credential_never_reaches_the_command_line(self):
+        """The case the review was actually about."""
+        value = "example-placeholder-value"
+        alert = {"alert_id": "orca-2", "feature_type": "secret",
+                 "code_snippet": [f'API_KEY = "{value}"'],
+                 "description": "", "recommendation": "",
+                 "file_path": "app.py", "position": {}}
+        task = AlertTask(alert_id="orca-2", title="Hardcoded secret",
+                         risk_level="high", feature_type="secret",
+                         source="app.py:1", alert_json=alert,
+                         worktree_path=Path("/tmp/orca-fix-x"))
+        with patch("subprocess.run") as run:
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
+            with patch.object(Path, "exists", return_value=True), \
+                 patch.object(Path, "read_text", return_value="# i"):
+                _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
+        call = run.call_args_list[0]
+        self.assertIn(value, call.kwargs["input"])
+        self.assertNotIn(value, " ".join(str(c) for c in call.args[0]))
+
+    def test_no_module_passes_a_prompt_positionally(self):
+        """Guard against a fifth call site reintroducing it."""
+        for module, name in ((orchestrator, "_invoke_fix_agent"),
+                             (validator, "llm_validate"),
+                             (impact_agent, "analyze_impact"),
+                             (package_identity, "_match_from_llm")):
+            with self.subTest(f"{module.__name__}.{name}"):
+                src = inspect.getsource(getattr(module, name))
+                self.assertNotIn('"-p", prompt', src)
+                self.assertIn("input=prompt", src)
+
+    def test_single_shot_turn_economics_are_still_asserted(self):
+        """validator.py:53 documents how easily one turn regresses to three."""
+        self.assertEqual(validator._SINGLE_SHOT_MAX_TURNS, 1)
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -395,6 +516,7 @@ if __name__ == "__main__":
         TestToolScope,
         TestAgentEnv,
         TestInjectionShapeEndToEnd,
+        TestPromptNeverReachesArgv,
     ]
 
     _registered = {cls.__name__ for cls in test_classes}

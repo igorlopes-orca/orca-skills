@@ -302,11 +302,13 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
     # The whole prompt, not just the diff: alert_json carries code_snippet, which
     # for a secret finding *is* the credential. This is a third-party API call.
     prompt = redactor(prompt)
-    cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
+    # stdin, not argv — see orchestrator._invoke_fix_agent. The diff below is
+    # the removed credential for a secret finding.
+    cmd = ["claude", "-p", *_SINGLE_SHOT_TOOL_FLAGS,
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                                 timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] LLM validation timed out after {timeout_sec}s")

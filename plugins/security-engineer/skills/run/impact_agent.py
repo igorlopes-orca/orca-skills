@@ -152,15 +152,16 @@ def analyze_impact(
     prompt = redactor(prompt)
     # No tools at all — see _SINGLE_SHOT_TOOL_FLAGS for why denying them was
     # not the same thing, and cost 6x more.
+    # stdin, not argv — see orchestrator._invoke_fix_agent.
     cmd = [
-        "claude", "-p", prompt,
+        "claude", "-p",
         *_SINGLE_SHOT_TOOL_FLAGS,
         "--output-format", "json",
         "--max-turns", str(_SINGLE_SHOT_MAX_TURNS),
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_sec,
+            cmd, input=prompt, capture_output=True, text=True, timeout=timeout_sec,
             env=agent_env(),
         )
     except subprocess.TimeoutExpired:

@@ -139,7 +139,7 @@ class TestModelPromptsAreScrubbed(unittest.TestCase):
             run.return_value.returncode = 0
             run.return_value.stdout = '{"verdict": "pass"}'
             validator.llm_validate(SECRET_ALERT, Path("/tmp/x"))
-        prompt = run.call_args[0][0][2]
+        prompt = run.call_args.kwargs["input"]
         self.assertNotIn(SECRET, prompt)
 
     def test_impact_prompt(self):
@@ -147,7 +147,7 @@ class TestModelPromptsAreScrubbed(unittest.TestCase):
             run.return_value.returncode = 0
             run.return_value.stdout = '{"level": "low", "description": "ok"}'
             impact_agent.analyze_impact(SECRET_ALERT, f'-API_KEY = "{SECRET}"\n')
-        prompt = run.call_args[0][0][2]
+        prompt = run.call_args.kwargs["input"]
         self.assertNotIn(SECRET, prompt)
 
     def test_model_prose_is_scrubbed_on_the_way_back(self):
@@ -177,7 +177,7 @@ class TestModelPromptsAreScrubbed(unittest.TestCase):
             run.return_value.returncode = 0
             run.return_value.stdout = '{"verdict": "pass"}'
             validator.llm_validate(CVE_ALERT, Path("/tmp/x"))
-        self.assertIn("pillow==11.3.0", run.call_args[0][0][2])
+        self.assertIn("pillow==11.3.0", run.call_args.kwargs["input"])
 
 
 class TestPullRequestBody(unittest.TestCase):

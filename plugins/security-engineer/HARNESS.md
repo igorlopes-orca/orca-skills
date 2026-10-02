@@ -248,6 +248,18 @@ than merely denying the call. Verified against claude 2.1.276: under an npm-scop
 allowlist, `cat /etc/hostname` is denied, and so is `npm install … ; echo x` —
 the matcher splits on shell operators rather than prefix-matching the whole line.
 
+**A prompt reaches the subprocess on stdin, never in `argv`.** `claude -p <prompt>`
+puts the whole prompt on the command line, where any local user reads it through
+`ps -efww` or `/proc/<pid>/cmdline`, and where process-exec audit logs and EDR
+telemetry record it by default. The content is what makes that matter: for a
+`secret` finding the fix prompt contains the credential Orca detected, and the
+validation diff contains it being removed — for up to 240s, across as many as 12
+concurrent agents. All four `claude -p` calls now pass the prompt as stdin, so
+there is no command-line copy and no file on disk either. Verified by scanning
+`/proc` for a canary during a live run: present in the `claude` process's argv
+before the change, absent after. This closes the *local* copy only — the prompt
+still goes to the API, which is `redact.py`'s job.
+
 **A model subprocess sees an allowlisted environment.** There was no `env=`
 anywhere, so all four `claude -p` calls inherited `ORCA_API_TOKEN`,
 `NOTIFY_WEBHOOK_URL` and whatever `gh` was authenticated with. `agent_env.py`
