@@ -33,6 +33,11 @@ import orchestrator
 import validator
 from redact import PLACEHOLDER, Redactor, build_redactor
 
+# A deliberately fake credential. redact.py only needs a value of length >= 6;
+# this one wears the `sk-live-` shape on purpose, because the fixture has to look
+# like the thing the redactor is being tested against. It is not a real key and
+# has never been valid anywhere.
+# orca-secrets ignore-line
 SECRET = "sk-live-9f3a2b7c1d8e4f6a0b2c"
 
 SECRET_ALERT = {
