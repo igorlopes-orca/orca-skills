@@ -15,6 +15,7 @@
 ---
 
 ### Table of Contents
+- [Plugins](#plugins)
 - [Skills Overview](#skills-overview)
 - [Installation](#installation)
 - [MCP Configuration](#mcp-configuration)
@@ -24,6 +25,22 @@
 - [Support](#support)
 - [License](#license)
 - [Credits](#credits)
+
+
+## Plugins
+
+This marketplace carries two plugins. They are installed separately, and most
+people want the first one.
+
+| Plugin | What it is | Prerequisites |
+|---|---|---|
+| [`orca-skills`](#skills-overview) | 16 read-only skills that answer questions about your cloud environment through the Orca MCP server | The Orca MCP server. Nothing else |
+| [`security-engineer`](plugins/security-engineer/) | An autonomous agent that **remediates** Orca findings in your source code and opens a pull request per fix | Python 3.10+, authenticated [`gh`](https://cli.github.com/), `ORCA_API_TOKEN` in the environment, network access to OSV.dev and deps.dev |
+
+They answer different questions and are kept apart on purpose: `orca-skills`
+reads and explains your **cloud posture**; `security-engineer` writes code
+against your **repositories**. Installing `orca-skills` does not pull in the
+second plugin or any of its prerequisites.
 
 
 ## Skills Overview
@@ -42,6 +59,9 @@
 | [`orca-investigate`](#orca-investigate) | "What happened, who did it, and how far did they get?" |
 | [`orca-cloud-cost-optimizer`](#orca-cloud-cost-optimizer) | "Where are we overspending and what should we fix first?" |
 | [`orca-custom-framework`](#orca-custom-framework) | "How do I create a custom compliance framework tailored to my needs?" |
+| [`orca-inactive-identities-cleanup`](#orca-inactive-identities-cleanup) | "Which of our identities are dead weight, and how do we safely disable or delete them?" |
+| [`orca-overprivileged-identities-rightsizing`](#orca-overprivileged-identities-rightsizing) | "Which of our identities hold far more permission than they use, and how do we safely cut them down?" |
+| [`orca-mfa-enforcement`](#orca-mfa-enforcement) | "Who can sign in without MFA, and how do we close that gap without locking anyone out?" |
 | [`orca-supply-chain-exposure`](skills/orca-supply-chain-exposure/) | "From this list of suspect packages, which are we actually running and where?" |
 | [`orca-cve-blast-radius`](skills/orca-cve-blast-radius/) | "This CVE just dropped — which assets are actually at risk?" |
 | [`orca-account-health`](skills/orca-account-health/) | "Is every account connected, synced, and fully scanned?" |
@@ -62,6 +82,8 @@
 > **Pre-audit / pre-investigation:** Account health → Compliance gaps / Investigate (trust the data first)
 >
 > **Connector setup:** Connector troubleshoot → (escalate to support if a known platform limitation)
+>
+> **Code remediation:** CVE blast radius (which cloud assets are hit) → `security-engineer` (fix the repos that ship them, one PR per fix)
 
 ## Installation
 
@@ -71,7 +93,16 @@
 /plugin marketplace add orcasecurity/orca-skills
 ```
 
+Then install whichever plugins you want:
+
+```bash
+claude plugin install orca-skills@orcasecurity          # the 16 MCP skills
+claude plugin install security-engineer@orcasecurity    # autonomous remediation
+```
+
 **Next step:** Configure the Orca Security MCP server (see [MCP Configuration](#mcp-configuration) below).
+`security-engineer` does not use MCP — its setup is in
+[its own README](plugins/security-engineer/README.md).
 
 ### Claude Desktop
 
@@ -125,6 +156,11 @@ Add to your `.mcp.json` (in project root or `~/.claude/.mcp.json`):
 
 **Get your API token:** [Orca API Authentication Guide](https://docs.orcasecurity.io/docs/managing-api-tokens)  
 **MCP Integration Docs:** [Orca MCP Setup](https://orca.security/mcp-server/)
+
+> **The `security-engineer` plugin does not read MCP.** It calls
+> `api.orcasecurity.io/api/serving-layer/query` directly and expects the same
+> token in `ORCA_API_TOKEN` as an environment variable rather than in
+> `.mcp.json`. Configuring one does not configure the other.
 
 
 ## Skill Details
@@ -807,6 +843,79 @@ RECOMMENDED ACTION:
 
 </details>
 
+<details>
+<summary><strong><a id="orca-mfa-enforcement"></a>orca-mfa-enforcement</strong></summary>
+
+**"Who can sign in without MFA, and how do we close that gap without locking anyone out?"**
+
+MFA gap sweep across an account, business unit, or tag in every cloud Orca supports: finds users whose console sign-in is unprotected, ranks them by identity risk score, and drives remediation through guided enrollment or a gated enforcement path. A password-only user is one phish away from being an attacker, and no cloud lets an admin enroll MFA on someone's behalf, so enforcement means a policy that locks the user out until they enroll themselves.
+
+**Features:**
+- Cross-cloud coverage — AWS, Azure (incl. Entra ID), GCP (via Google Workspace), Alibaba Cloud, OCI, Tencent Cloud
+- Per-provider capability matrix — what MFA means on each cloud, and what each one cannot show you
+- Risk-first ranking with privilege, crown-jewel, and open-alert bumps
+- Root accounts handled fail-closed in their own bucket — an unreadable root signal escalates rather than being dismissed
+- Usage-aware remediation — a console password nobody uses is removed rather than enrolled
+- Three gated paths: guide (instructions + owner notifications), enforce (require-MFA policy), remove-access (delete an unused login profile)
+- Evidence-based confirmation — the consequence is restated before consent, and a bulk instruction never implies enforcement
+- Zero-finding runs publish proof of completeness rather than a bare "nothing found"
+- Closed loop — actions are commented and snoozed on the related alerts, with a post-scan recheck
+
+**Usage:**
+```bash
+# Sweep an account, business unit, or tag
+/orca-mfa-enforcement 123456789012
+/orca-mfa-enforcement "Production"
+/orca-mfa-enforcement --tag env=prod
+
+# Or use natural language
+who can log in without MFA?
+does our root account have MFA?
+find console users missing 2FA in the Production BU
+```
+
+**Drill-down keywords** (type after the sweep):
+```
+detail <user>     # Full evidence for one identity
+guide <ids|all>   # Enrollment instructions + owner notifications
+enforce <ids>     # Require-MFA policy (passes the confirmation gate)
+remove-access     # Delete an unused console password (gated)
+recheck           # Post-scan delta: who enrolled, which alerts closed
+cloud <provider>  # Re-scope to one cloud
+```
+
+**Example output:**
+```
+═══════════════════════════════════════════════════════════════════
+MFA SWEEP — acme-production
+═══════════════════════════════════════════════════════════════════
+
+8 users can sign in without MFA, including the root account.
+2 are privileged. 1 signed in password-only this week.
+
+ #  Identity                                   Provider  Risk      Action
+ 1  arn:aws:iam::123456789012:user/deploy      AWS       Critical  Guide, then enforce
+ 2  arn:aws:iam::123456789012:root             AWS       High      Guide only (root)
+ 3  arn:aws:iam::123456789012:user/analyst     AWS       High      Remove unused password
+
+ROOT ACCOUNT:
+  No API can enroll MFA on root — the account owner must do it signed
+  in as root. Hardware MFA recommended (CIS).
+
+QUICK WINS:
+  6 console passwords were never used. Removing them closes the gap
+  with zero user friction, and access keys are untouched.
+
+MFA ENFORCEMENT SUMMARY
+  Found: 8   Proposed: 8   Guided: 0   Enforced: 0   Skipped: 0
+  Routed: 18 outside Found (14 API-only, 4 dormant — not MFA gaps)
+═══════════════════════════════════════════════════════════════════
+```
+
+[Full Documentation →](skills/orca-mfa-enforcement/)
+
+</details>
+
 
 <details>
 <summary><strong><a id="orca-investigate"></a>orca-investigate</strong></summary>
@@ -1045,6 +1154,217 @@ cluster shows connected in Orca but no inventory data is showing up
 
 </details>
 
+<details>
+<summary><strong><a id="security-engineer"></a>security-engineer</strong> — separate plugin</summary>
+
+**"Fix it, and show me the pull request."**
+
+An autonomous remediation agent, shipped as its own plugin because it writes code
+rather than answering questions. For each Orca finding in a repository it cuts an
+isolated git worktree, decides the target version from advisory data where it
+can, invokes a Claude subprocess to apply the change, runs the result through
+five gates, assesses production impact, and opens a pull request carrying that
+assessment. Nothing is merged automatically.
+
+**Requires** Python 3.10+, an authenticated `gh`, and `ORCA_API_TOKEN` in the
+environment — it does not read the MCP server.
+
+**Features:**
+- Covers CVE/SCA, SAST, IaC and secret findings across PyPI, npm, Go, Maven, Cargo, RubyGems and NuGet
+- CVE target versions resolved before the agent runs, from OSV.dev advisory ranges plus the deps.dev published-version list — policy is the lowest release clearing *every* advisory on the installed version
+- Five gates: diff sanity, an LLM verdict, a type-specific verify, the Orca GitHub App check on the opened PR (with its annotations fed back to the agent on retry), and CI
+- Anything a gate could not confirm is labelled `needs-review` rather than passed silently
+- `--dry-run` enforced three independent ways; `--scan` for a read-only risk list
+- Runs as a slash command, as plain English, or as a `security-engineer` binary in any terminal or CI job
+
+**Usage:**
+```bash
+/security-engineer:script high,cve --max 3     # explicit flags, taken as typed
+/security-engineer:script --scan               # list risks, fix nothing
+security-engineer --cve CVE-2020-7471          # same flags, in a shell
+
+# Or use natural language
+remediate all high vulnerabilities, max of 3
+show me what you'd do about the CVEs
+which of our repos still needs the log4shell fix?
+```
+
+**Example output:**
+```markdown
+## Security Engineer — Run Summary
+
+**Repo:** acme/api  |  **Mode:** Live
+
+### Fixed — PRs Opened (2)
+| Alert | Title | Risk | Type | Impact | PR |
+|---|---|---|---|---|---|
+| orca-4060720 | Vulnerable package pillow | high | cve | low | https://github.com/acme/api/pull/218 |
+| orca-4060654 | SQL injection in handler | high | sast | medium 👁 | https://github.com/acme/api/pull/219 |
+
+### Fix Failed (1)
+| Alert | State | Reason |
+|---|---|---|
+| orca-4061002 | FAILED | phase 3: terraform validate exited 1 |
+```
+
+The run exits non-zero if any alert failed, timed out, or landed with red CI —
+so a `&&` chain or a CI wrapper cannot read a broken run as green. `👁` marks a
+gate that passed without being able to confirm; that PR is labelled
+`needs-review`.
+
+[Full Documentation →](plugins/security-engineer/) · [How the harness works →](plugins/security-engineer/HARNESS.md)
+
+</details>
+
+
+<details>
+<summary><strong><a id="orca-inactive-identities-cleanup"></a>orca-inactive-identities-cleanup</strong></summary>
+
+**"Which of our identities are dead weight, and how do we safely disable or delete them?"**
+
+Sweeps an account or business unit for inactive identities (users, groups, and non-human identities) across every cloud provider Orca supports: AWS, Azure (incl. Entra ID), GCP (incl. Google Workspace), Alibaba Cloud, OCI, and Tencent Cloud. Ranks findings by identity risk score and drives cleanup through a non-destructive path (disable) or a destructive path (delete) that always requires explicit confirmation.
+
+**Features:**
+- Asks for the inactivity time frame if not given (90 days is Orca's built-in convention; 30/60/180 or custom supported)
+- Cross-cloud coverage: users, groups, and NHIs for all six supported providers
+- Anchored on Orca's pre-computed activity verdict (last-active timestamps), with CDR corroboration
+- Risk-first ranking: dormant admins, exposed credentials, and crown-jewel reach float to the top
+- Disable-first flow: reversible deactivation now, delete after a grace period
+- Explicit confirmation gate before any delete, with blast-radius preview (what still references the identity)
+- Automatic exclusions: break-glass accounts, identities too new to judge, possibly-human edge cases
+- Ready-to-run remediation artifacts (CLI/Terraform) with deletion prerequisites ordered correctly
+- Mandatory cleanup summary: found, disabled, deleted, proposed, skipped, and an estimate of alerts that will close
+
+**Usage:**
+```bash
+# Sweep an account or business unit
+/orca-inactive-identities-cleanup 123456789012
+/orca-inactive-identities-cleanup "Production"
+
+# Custom time frame, scope, or action
+/orca-inactive-identities-cleanup 123456789012 --inactive 60d
+/orca-inactive-identities-cleanup 123456789012 --only nhis
+/orca-inactive-identities-cleanup 123456789012 --action disable
+
+# Or use natural language
+clean up inactive identities in acme-production
+which users haven't been active in the last 60 days?
+disable the dormant service accounts in the Production BU
+```
+
+**Drill-down keywords** (type after the sweep):
+```
+detail <identity>   # Full evidence for one identity
+disable <ids|all>   # Generate disable artifacts
+delete <ids>        # Delete flow (explicit confirmation required)
+window <Nd>         # Re-run with a different time frame
+only <bucket>       # users | groups | nhis
+cloud <provider>    # aws | azure | gcp | alicloud | oci | tencent
+```
+
+**Example output:**
+```
+═══════════════════════════════════════════════════════════════════
+INACTIVE IDENTITY CLEANUP — acme-production
+Window: 60 days | AWS + Azure + GCP
+═══════════════════════════════════════════════════════════════════
+
+62 identities inactive for 60+ days: 41 users, 6 groups, 15 NHIs.
+9 carry high or critical risk.
+
+TOP RISK (highest first):
+  #  Identity              Type      Provider  Last active  Risk      Action
+  1  legacy-admin          IAM user  AWS       142d ago     Critical  Disable now
+  2  svc-deploy-old        SP        Azure     never        High      Disable now
+  3  ci-runner-2019        Role      AWS       201d ago     High      Disable now
+
+QUICK WINS: 12 identities with zero privileges and zero activity.
+
+CLEANUP SUMMARY  (window: 60 days)
+  Found:     62 | Disabled: 0 | Deleted: 0 | Proposed: 55 | Skipped: 7
+  Alerts:    ~24 open alerts on these identities close after the next scan
+═══════════════════════════════════════════════════════════════════
+```
+
+[Full Documentation →](skills/orca-inactive-identities-cleanup/)
+
+</details>
+
+
+<details>
+<summary><strong><a id="orca-overprivileged-identities-rightsizing"></a>orca-overprivileged-identities-rightsizing</strong></summary>
+
+**"Which of our identities hold far more permission than they use, and how do we safely cut them down?"**
+
+Sweeps an account or business unit for over-privileged identities using Orca's pre-computed PoLP (Principle of Least Privilege) recommendations across AWS, Azure, and GCP. Ranks findings by identity risk score and drives right-sizing through a non-destructive path (stage the change as ready-to-run artifacts) or a destructive path (apply) that always requires an evidence-based safety check plus explicit confirmation.
+
+**Features:**
+- Anchored on Orca's recommendation engine: per-identity verdicts computed from ~90 days of observed usage
+- Typed fixes per identity: read-only swap, scope reduction, generated least-privilege policy, or JIT conversion
+- Risk-first ranking with a "how over-privileged" column (services used vs granted)
+- Stage-first flow: artifacts with rollback and verification embedded, nothing auto-applied
+- Evidence-based apply gate: replays the identity's actual recent activity (CDR) against the proposed change and reports exactly what would break
+- Explicit confirmation before any apply, with blast-radius preview for roles
+- Automatic exclusions: provider-managed identities, break-glass accounts, vendor/cross-account roles
+- Clean handoffs: inactive identities route to `orca-inactive-identities-cleanup`, JIT candidates to JIT conversion
+- Mandatory right-sizing summary: found, staged, applied, held, skipped, and the standing permissions the plan removes
+
+**Usage:**
+```bash
+# Sweep an account or business unit
+/orca-overprivileged-identities-rightsizing 123456789012
+/orca-overprivileged-identities-rightsizing "Production"
+
+# Scope, provider, or pre-selected path
+/orca-overprivileged-identities-rightsizing 123456789012 --only nhis
+/orca-overprivileged-identities-rightsizing 123456789012 --cloud aws
+/orca-overprivileged-identities-rightsizing 123456789012 --action stage
+
+# Or use natural language
+right-size the over-privileged identities in acme-production
+which roles have permissions they never use?
+who has admin but only ever reads?
+```
+
+**Drill-down keywords** (type after the sweep):
+```
+detail <identity>   # Full evidence: used vs granted, the recommendation
+stage <ids|all>     # Generate right-sizing artifacts (nothing applied)
+apply <ids>         # Apply flow (safety check + explicit confirmation)
+safecheck <identity># Run the CDR replay on its own
+cloud <provider>    # aws | azure | gcp
+only <bucket>       # users | nhis
+```
+
+**Example output:**
+```
+═══════════════════════════════════════════════════════════════════
+OVER-PRIVILEGED IDENTITY RIGHT-SIZING — acme-production
+Engine window: ~90 days | AWS + Azure + GCP
+═══════════════════════════════════════════════════════════════════
+
+31 identities hold permissions they haven't used in ~90 days:
+9 users, 22 NHIs. 7 carry high or critical risk; right-sizing
+removes ~840 unused permissions.
+
+TOP RISK (highest first):
+  #  Identity        Type     Provider  Uses            Recommendation    Risk      Change
+  1  deploy-runner   Role     AWS       3 of 41 svcs    Reduce perms      Critical  Apply least-priv policy
+  2  ops-sp-legacy   SP       Azure     read-only use   Read-only swap    High      Swap to Reader
+  3  etl-sa          SA       GCP       narrow scope    Scope reduction   High      Re-scope binding
+
+QUICK WINS: 5 identities only ever read; swap to read-only today.
+
+RIGHT-SIZING SUMMARY  (engine window: ~90 days)
+  Found: 31 | Proposed: 24 | Staged: 0 | Applied: 0 | Held: 0 | Skipped: 3 | JIT: 4
+  Handed off: 12 inactive -> /orca-inactive-identities-cleanup
+  Removes: ~840 unused service grants once the staged plan is applied
+═══════════════════════════════════════════════════════════════════
+```
+
+[Full Documentation →](skills/orca-overprivileged-identities-rightsizing/)
+
+</details>
 
 ## Contributing
 
@@ -1052,11 +1372,13 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ### Adding a New Skill
 
-1. Create `skills/your-skill/SKILL.md`
-2. Follow the [skill template](docs/skill-template.md)
-3. Add tests if applicable
-4. Update this README
-5. Submit a pull request
+1. Open an issue describing the use case first — see [CONTRIBUTING.md](CONTRIBUTING.md#feature-requests)
+2. Create `skills/your-skill/SKILL.md`, following the shape of an existing skill
+3. Update this README — the overview table and a `<details>` block
+4. Submit a pull request
+
+Changes to the `security-engineer` plugin are Python rather than Markdown — see
+[its README](plugins/security-engineer/README.md#developing).
 
 ## Support
 
