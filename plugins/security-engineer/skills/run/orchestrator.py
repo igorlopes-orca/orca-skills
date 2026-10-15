@@ -509,17 +509,21 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
             error_code="timeout",
         )
 
+    # The agent was handed the credential to remove it, so anything it says back
+    # can quote it. Scrubbed here, every sink downstream inherits it.
+    redactor = build_redactor(task.alert_json)
     if result.returncode != 0:
         return FixAgentResult(
             success=False,
-            failure_reason=result.stderr[:300],
+            failure_reason=redactor(result.stderr[:300]),
             error_code="subprocess_error",
         )
 
-    return _parse_fix_result(result.stdout)
+    return _parse_fix_result(result.stdout, redactor)
 
 
-def _parse_fix_result(raw: str) -> FixAgentResult:
+def _parse_fix_result(raw: str, redactor=None) -> FixAgentResult:
+    redactor = redactor or build_redactor(None)
     try:
         envelope = json.loads(raw)
         text = envelope.get("result", "") or raw
@@ -538,13 +542,13 @@ def _parse_fix_result(raw: str) -> FixAgentResult:
         return FixAgentResult(
             success=True,
             files_changed=data.get("files_changed") or [],
-            diff_summary=data.get("diff_summary", ""),
-            manual_steps=data.get("manual_steps") or [],
+            diff_summary=redactor(data.get("diff_summary", "")),
+            manual_steps=redactor.scrub(data.get("manual_steps") or []),
         )
     else:
         return FixAgentResult(
             success=False,
-            failure_reason=data.get("reason", "unknown failure"),
+            failure_reason=redactor(data.get("reason", "unknown failure")),
             failed_step=data.get("step"),
         )
 
@@ -1514,7 +1518,8 @@ def _print_plan(to_fix, skipped, scm_posture, unfixable, repo, dry_run,
     if to_fix:
         print("\nPlanned fixes:")
         for i, t in enumerate(to_fix, 1):
-            print(f"  {i}. {t.alert_id} — {t.title} ({t.risk_level}, {t.feature_type}) — {t.source}")
+            title = build_redactor(t.alert_json)(t.title)
+            print(f"  {i}. {t.alert_id} — {title} ({t.risk_level}, {t.feature_type}) — {t.source}")
             # A package alert covers every advisory in its package, and the
             # minimum-safe bump clears all of them. Say so before the run, not
             # in the PR body afterwards.
@@ -1553,7 +1558,8 @@ def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: lis
             impact = t.impact.level if t.impact else "-"
             ci_note = " ⚠️" if t.state == "CI_FAILED" else ""
             review_note = " 👁" if t.needs_review else ""
-            print(f"| {t.alert_id} | {t.title} | {t.risk_level} | {t.feature_type} "
+            title = build_redactor(t.alert_json)(t.title)
+            print(f"| {t.alert_id} | {title} | {t.risk_level} | {t.feature_type} "
                   f"| {impact}{ci_note}{review_note} | {t.pr_url or '-'} |")
 
     if failed:
@@ -1561,7 +1567,11 @@ def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: lis
         print("| Alert | State | Reason |")
         print("|---|---|---|")
         for t in failed:
-            print(f"| {t.alert_id} | {t.state} | {t.failure_reason or '-'} |")
+            # failure_reason is set from exception strings and build output as
+            # well as the agent, so the summary scrubs it rather than trusting
+            # every producer to have.
+            reason = build_redactor(t.alert_json)(t.failure_reason) or "-"
+            print(f"| {t.alert_id} | {t.state} | {reason} |")
 
     if all_skipped:
         print(f"\n### Skipped — Branch Exists ({len(all_skipped)})")
@@ -1569,7 +1579,7 @@ def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: lis
         print("|---|---|")
         for item in all_skipped:
             if isinstance(item, AlertTask):
-                print(f"| {item.alert_id} | {item.title} |")
+                print(f"| {item.alert_id} | {build_redactor(item.alert_json)(item.title)} |")
             else:
                 print(f"| {item.get('alert_id', '-')} | {item.get('title', '-')} |")
 

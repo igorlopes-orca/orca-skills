@@ -343,6 +343,8 @@ closed at the point of egress (`redact.py`):
 | Impact `description` / `concerns` / `manual_steps` → PR body | Yes, on parse |
 | PR title and body → GitHub, watch notifications | Yes, immediately before `open-pr` |
 | `NotificationPayload` → console, run log, webhook | Yes, in `_notify_payload` — one chokepoint, so a backend added later inherits it |
+| Fix agent `reason` / `diff_summary` / `manual_steps`, and its stderr on a crash | Yes, on parse in `_invoke_fix_agent` |
+| Run plan and run summary → stdout | Yes — title and `failure_reason`, which is also set from exception strings and build output |
 | The commit diff itself | **No — not possible.** A commit that removes a line renders that line. This is what the PR warning exists for |
 
 Candidates come from the alert's `code_snippet`, longest first: the quoted value

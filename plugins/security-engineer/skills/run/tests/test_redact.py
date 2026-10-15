@@ -20,8 +20,10 @@ Hermetic: no network, no claude subprocess.
 Run with: python3 tests/test_redact.py
 """
 import hashlib
+import io
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -299,6 +301,75 @@ class TestNotificationPayload(unittest.TestCase):
 
     def test_none_reason_survives(self):
         self.assertIsNone(self._payload(SECRET_ALERT).reason)
+
+
+class TestFixAgentReasonAtSource(unittest.TestCase):
+    """The fix agent's failure reason feeds the summary, the run log, the webhook
+    and the PR body. Scrubbed where it is captured, no later sink can miss it."""
+
+    def _invoke(self, returncode, stdout="", stderr=""):
+        task = orchestrator.AlertTask(
+            alert_id="orca-abc123", title="t", risk_level="high",
+            feature_type="secret", source="app.py:14",
+            alert_json=SECRET_ALERT, worktree_path=Path("/tmp/x"))
+        with patch.object(orchestrator.subprocess, "run") as run, \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value="# i"):
+            run.return_value.returncode = returncode
+            run.return_value.stdout = stdout
+            run.return_value.stderr = stderr
+            return orchestrator._invoke_fix_agent(task, dry_run=False, timeout_sec=5)
+
+    def test_reported_reason_is_scrubbed(self):
+        raw = f'{{"status": "failed", "reason": "could not remove {SECRET}", "step": "fix_apply"}}'
+        result = self._invoke(0, stdout=raw)
+        self.assertFalse(result.success)
+        self.assertNotIn(SECRET, result.failure_reason)
+        self.assertIn(PLACEHOLDER, result.failure_reason)
+
+    def test_agent_summary_is_scrubbed(self):
+        raw = (f'{{"status": "success", "files_changed": ["app.py"], '
+               f'"diff_summary": "removed {SECRET}", "manual_steps": ["rotate {SECRET}"]}}')
+        result = self._invoke(0, stdout=raw)
+        self.assertNotIn(SECRET, result.diff_summary)
+        self.assertNotIn(SECRET, " ".join(result.manual_steps))
+
+    def test_subprocess_error_is_scrubbed(self):
+        result = self._invoke(1, stderr=f"error near API_KEY = \"{SECRET}\"")
+        self.assertNotIn(SECRET, result.failure_reason)
+
+    def test_parse_without_a_redactor_still_works(self):
+        result = orchestrator._parse_fix_result('{"status": "failed", "reason": "r"}')
+        self.assertEqual(result.failure_reason, "r")
+
+
+class TestRunSummary(unittest.TestCase):
+    """The summary prints failure_reason, which can come from anywhere — an
+    exception string, a build log, a gate — not only the fix agent."""
+
+    def test_failure_reason_and_title_are_scrubbed(self):
+        failed = orchestrator.AlertTask(
+            alert_id="orca-abc123", title=f"leaked {SECRET}", risk_level="high",
+            feature_type="secret", source="app.py:14", alert_json=SECRET_ALERT,
+            state="FAILED", failure_reason=f"local build failed: {SECRET}")
+        done = orchestrator.AlertTask(
+            alert_id="orca-abc124", title=f"leaked {SECRET}", risk_level="high",
+            feature_type="secret", source="app.py:14", alert_json=SECRET_ALERT,
+            state="DONE", pr_url="https://github.com/o/r/pull/1")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            orchestrator._print_summary([failed, done], [], [], "o/r", dry_run=False)
+        self.assertNotIn(SECRET, out.getvalue())
+        self.assertIn("local build failed", out.getvalue())
+
+    def test_plan_title_is_scrubbed(self):
+        task = orchestrator.AlertTask(
+            alert_id="orca-abc123", title=f"leaked {SECRET}", risk_level="high",
+            feature_type="secret", source="app.py:14", alert_json=SECRET_ALERT)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            orchestrator._print_plan([task], [], [], [], "o/r", dry_run=False)
+        self.assertNotIn(SECRET, out.getvalue())
 
 
 if __name__ == "__main__":
