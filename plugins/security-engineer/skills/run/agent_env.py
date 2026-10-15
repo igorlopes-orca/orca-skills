@@ -50,9 +50,9 @@ _ALLOW = frozenset({
 })
 
 # Allowed for the model subprocess, which needs them to reach Claude; withheld
-# from build checks, which run repository code and need none of them.
-_MODEL_ONLY = frozenset(n for n in _ALLOW
-                        if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_")))
+# from build checks, which run repository code and need none of them. A prefix,
+# so one added through extra_env is withheld too.
+_MODEL_ONLY_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
 
 # Names fix_agent.extra_env may never add back. The literal four are the ones
 # this change exists to withhold; the pattern catches the shape of the rest, so
@@ -92,7 +92,5 @@ def build_env(extra: list | None = None) -> dict:
     agent_env() without Claude's credentials. fix_agent.extra_env still applies,
     so a private registry an operator opted into reaches the build that needs it.
     """
-    env = agent_env(extra)
-    for name in _MODEL_ONLY:
-        env.pop(name, None)
-    return env
+    return {k: v for k, v in agent_env(extra).items()
+            if not k.startswith(_MODEL_ONLY_PREFIXES)}

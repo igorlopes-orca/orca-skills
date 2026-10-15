@@ -23,7 +23,7 @@ import impact_agent
 import orchestrator
 import package_identity
 import validator
-from agent_env import agent_env
+from agent_env import agent_env, build_env
 from orchestrator import AlertTask, _build_prompt_context, _invoke_fix_agent
 from pipelines import get_pipeline
 from pipelines.base import FixPlan
@@ -384,6 +384,12 @@ class TestBuildCheckEnv(unittest.TestCase):
         seen = self._env_seen_by(self._run_check, ["AWS_REGION"])
         self.assertIn("PATH", seen)
         self.assertIn("AWS_REGION", seen)
+
+    def test_extra_env_cannot_hand_a_build_claude_settings(self):
+        """ANTHROPIC_CUSTOM_HEADERS can carry auth; opting it in is for the model."""
+        with patch.dict(os.environ, {"ANTHROPIC_CUSTOM_HEADERS": "x"}):
+            self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS",
+                             build_env(["ANTHROPIC_CUSTOM_HEADERS"]))
 
     def test_python_syntax_check_does_not_import_from_the_tree(self):
         """`python3 -m py_compile` puts cwd first on sys.path, so a committed
