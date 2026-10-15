@@ -717,6 +717,20 @@ def _flag_review(task: AlertTask, reason: str) -> None:
         task.review_reasons.append(flat)
 
 
+def _mark_open_pr_failed(task: AlertTask, reason: str) -> None:
+    """Mark a PR the run is giving up on after it was opened.
+
+    The post-PR gates are the only ones that can fail with a pushed branch and
+    a published PR behind them, which makes that PR the one the marker exists
+    for. Body first, as at the end of _run_pipeline: it does not depend on the
+    repo letting us create labels.
+    """
+    _flag_review(task, reason)
+    _sync_pr_body(task)
+    if task.pr_url:
+        _add_label(task.pr_url, "needs-review")
+
+
 def _review_section(reasons: list[str]) -> str:
     """The needs-review warning as it appears at the top of the PR body.
 
@@ -1156,12 +1170,20 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 print(f"[RETRY] {task.alert_id} Orca check found issues, "
                       f"retrying fix (attempt {orca_attempt + 2})", flush=True)
                 _revert(task.worktree_path)
+                # What the PR branch carries until a retry is pushed. A rejected
+                # retry must not end up described in the body of a PR it never
+                # reached.
+                pushed_fix = task.fix_result
+                retry_failed = ("The Orca check failed on this PR and the automated "
+                                "retry was abandoned, so the branch still carries "
+                                "the fix the check failed")
                 timeout = pipeline.timeout_sec
                 fix_result = _invoke_fix_agent(task, dry_run, timeout,
                                                feedback=orca_feedback)
                 if not fix_result.success:
                     task.state = "FAILED"
                     task.failure_reason = fix_result.failure_reason
+                    _mark_open_pr_failed(task, f"{retry_failed}: {task.failure_reason}")
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("fix_failed", p)
@@ -1176,6 +1198,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 if not sanity2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(sanity2.failures)
+                    task.fix_result = pushed_fix
+                    _mark_open_pr_failed(task, f"{retry_failed}: {task.failure_reason}")
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("validation_failed", p)
@@ -1185,6 +1209,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 if not build2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(build2.failures)
+                    task.fix_result = pushed_fix
+                    _mark_open_pr_failed(task, f"{retry_failed}: {task.failure_reason}")
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("validation_failed", p)
@@ -1196,6 +1222,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 except RuntimeError as e:
                     task.state = "FAILED"
                     task.failure_reason = f"push fix update failed: {e}"
+                    task.fix_result = pushed_fix
+                    _mark_open_pr_failed(task, f"{retry_failed}: {task.failure_reason}")
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("fix_failed", p)
@@ -1217,6 +1245,10 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 # "fail" or default
                 task.state = "FAILED"
                 task.failure_reason = "; ".join(orca_val.failures)
+                _mark_open_pr_failed(
+                    task,
+                    f"Orca check still failing after {orca_cfg.max_retries + 1} "
+                    f"attempts: {task.failure_reason}")
                 p = _notify_payload(task)
                 p.repo = repo.name
                 notifier.notify("validation_failed", p)

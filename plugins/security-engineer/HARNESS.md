@@ -369,7 +369,7 @@ of a bad fix, fail open on absence of evidence — and say so.**
 | LLM verdict `fail` | **Closed** — `FAILED` |
 | Manifest untouched, dependency removed, lockfile disagrees, applied version still vulnerable | **Closed** — `FAILED` |
 | Build command present and exits non-zero | **Closed** — `FAILED` |
-| Orca check reports findings | **Closed after retries** — per `on_failure` |
+| Orca check reports findings | **Closed after retries** — per `on_failure`. The PR is already open, so a `FAILED` here, or a retry that is abandoned, also labels it `needs-review` and puts the reason in its body |
 | CI red | **Closed** — `CI_FAILED`, exit 1, PR labelled |
 | Branch holds commits not in `main` | **Closed** — `SKIPPED`, work untouched |
 | LLM validation times out / errors / returns unparseable output | Open + `needs-review` |

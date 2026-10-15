@@ -2597,6 +2597,110 @@ class TestEveryGateRecordsWhy(unittest.TestCase):
                         src.index('_add_label(pr_url, "needs-review")'))
 
 
+class TestOrcaFailureMarksTheOpenPr(unittest.TestCase):
+    """The Orca check runs after the PR is open, so every way it ends the run
+    leaves a published PR behind. Those returned FAILED with neither the label
+    nor the body saying so — the one PR that most needed the marker.
+    """
+
+    PR = "https://github.com/owner/repo/pull/1"
+
+    def _run(self, fixes, orca, sanity=None):
+        task = AlertTask(
+            alert_id="orca-retry-1", title="Path Traversal", risk_level="high",
+            feature_type="sast", source="server.js:40",
+            alert_json={"alert_id": "orca-retry-1", "feature_type": "sast"})
+        gh_calls = []
+
+        def gh(cmd, **_kw):
+            gh_calls.append(cmd)
+            # Every label call fails, as on a repo gh cannot create labels in;
+            # the body must not depend on them.
+            rc = 1 if ("label" in cmd[:2] or "--add-label" in cmd) else 0
+            return subprocess.CompletedProcess(cmd, rc, "", "denied" if rc else "")
+
+        def open_pr(t, impact, dry_run):
+            t.pr_body = _build_pr_body(t, impact)
+            return self.PR
+
+        val_pass = ValidationResult(passed=True, phase="sanity")
+        with patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-t")), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._revert"), \
+             patch("orchestrator._invoke_fix_agent", side_effect=fixes), \
+             patch("orchestrator.sanity_check",
+                   side_effect=sanity or (lambda *a, **k: val_pass)), \
+             patch("orchestrator.llm_validate", return_value=val_pass), \
+             patch("pipelines.base.local_build_check", return_value=val_pass), \
+             patch("orchestrator._get_diff", return_value="diff"), \
+             patch("orchestrator.analyze_impact", return_value=ImpactResult(
+                 level="low", description="minor", downtime_risk=False,
+                 requires_deploy=True)), \
+             patch("orchestrator._commit_and_pr", side_effect=open_pr), \
+             patch("orchestrator._push_fix_update"), \
+             patch("orchestrator.orca_check_gate", side_effect=orca), \
+             patch("orchestrator.ci_gate") as ci, \
+             patch("orchestrator.subprocess.run", side_effect=gh):
+            result = run_one(task, dry_run=False, notifier=MagicMock(), repo=Repository(
+                name="owner/repo", url="https://github.com/owner/repo"))
+        ci.assert_not_called()
+        return result, gh_calls
+
+    @staticmethod
+    def _body_edits(calls):
+        return [c[c.index("--body") + 1] for c in calls
+                if c[:3] == ["gh", "pr", "edit"] and "--body" in c]
+
+    def _assert_marked(self, result, calls, reason):
+        self.assertEqual(result.state, "FAILED")
+        self.assertTrue(result.needs_review)
+        bodies = self._body_edits(calls)
+        self.assertEqual(len(bodies), 1, "the body is updated even though every label call failed")
+        self.assertIn("Needs human review", bodies[0])
+        self.assertIn(reason, bodies[0])
+        labelled = [i for i, c in enumerate(calls) if "--add-label" in c]
+        self.assertEqual([calls[i][-1] for i in labelled], ["needs-review"])
+        body_at = next(i for i, c in enumerate(calls) if "--body" in c)
+        self.assertLess(body_at, labelled[0], "body first: it does not depend on labels")
+        return bodies[0]
+
+    def _fix(self, summary):
+        return FixAgentResult(success=True, files_changed=["server.js"],
+                              diff_summary=summary)
+
+    def _orca_fail(self, msg="server.js:41 [failure] persistent SAST finding"):
+        return ValidationResult(passed=False, phase="orca_check", failures=[msg])
+
+    def test_retries_exhausted(self):
+        n = orchestrator.CFG.orca_check.max_retries + 1
+        result, calls = self._run(fixes=[self._fix("patched")] * n,
+                                  orca=[self._orca_fail()] * n)
+        self._assert_marked(result, calls, "persistent SAST finding")
+
+    def test_retry_fix_agent_fails(self):
+        if orchestrator.CFG.orca_check.max_retries < 1:
+            self.skipTest("retries disabled in this config")
+        failed = FixAgentResult(success=False, failure_reason="no alternative approach found")
+        result, calls = self._run(fixes=[self._fix("patched"), failed],
+                                  orca=[self._orca_fail()])
+        self._assert_marked(result, calls, "no alternative approach found")
+
+    def test_rejected_retry_keeps_the_pushed_fix_in_the_body(self):
+        """The retry never reached the branch, so the body must not describe it."""
+        if orchestrator.CFG.orca_check.max_retries < 1:
+            self.skipTest("retries disabled in this config")
+        verdicts = iter([ValidationResult(passed=True, phase="sanity"),
+                         ValidationResult(passed=False, phase="sanity",
+                                          failures=["diff too large"])])
+        result, calls = self._run(
+            fixes=[self._fix("patched path traversal"), self._fix("rewrote the router")],
+            orca=[self._orca_fail()],
+            sanity=lambda *a, **k: next(verdicts))
+        body = self._assert_marked(result, calls, "diff too large")
+        self.assertIn("patched path traversal", body)
+        self.assertNotIn("rewrote the router", body)
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -2657,6 +2761,7 @@ if __name__ == "__main__":
         TestReviewReasonReachesThePrBody,
         TestPostPrReasonsAreRepublished,
         TestEveryGateRecordsWhy,
+        TestOrcaFailureMarksTheOpenPr,
     ]
 
     # The list above is hand-maintained, so a new test class that nobody adds to
