@@ -10,6 +10,7 @@ Run with: python3 tests/test_untrusted.py
 import inspect
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -345,6 +346,71 @@ class TestAgentEnv(unittest.TestCase):
                 self.assertIn("env=agent_env()", src)
 
 
+class TestBuildCheckEnv(unittest.TestCase):
+    """A build check runs code the tenant wrote: `npm run build` is their script.
+
+    These run a real subprocess, because the property is what the child can see,
+    not which keyword argument was passed.
+    """
+
+    WITHHELD = ["ORCA_API_TOKEN", "GH_TOKEN", "NOTIFY_WEBHOOK_URL",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+    PROBE = [*WITHHELD, "PATH", "AWS_REGION"]
+
+    def _env_seen_by(self, check, extra_env):
+        """The PROBE names visible to the child, which reports them and fails."""
+        dump = ("import os, sys; "
+                f"sys.stderr.write(' '.join(n for n in {self.PROBE!r} if n in os.environ)); "
+                "sys.exit(1)")
+        planted = dict.fromkeys([*self.WITHHELD, "AWS_REGION"], "x")
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, planted), \
+             patch("agent_env.load_config") as cfg:
+            cfg.return_value.fix_agent.extra_env = extra_env
+            result = check(dump, Path(d))
+        self.assertFalse(result.passed, result.failures)
+        return set(result.failures[0].split(":", 1)[1].split())
+
+    @staticmethod
+    def _run_check(dump, cwd):
+        return validator._run_check([sys.executable, "-c", dump], cwd)
+
+    def test_build_check_cannot_see_our_credentials(self):
+        seen = self._env_seen_by(self._run_check, [])
+        for name in self.WITHHELD:
+            self.assertNotIn(name, seen, name)
+
+    def test_build_check_keeps_path_and_extra_env(self):
+        seen = self._env_seen_by(self._run_check, ["AWS_REGION"])
+        self.assertIn("PATH", seen)
+        self.assertIn("AWS_REGION", seen)
+
+    def test_python_syntax_check_does_not_import_from_the_tree(self):
+        """`python3 -m py_compile` puts cwd first on sys.path, so a committed
+        py_compile.py ran instead of the stdlib one, with the full environment."""
+        planted = dict.fromkeys(self.WITHHELD, "x")
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, planted):
+            root = Path(d)
+            (root / "py_compile.py").write_text(
+                "import os, sys\n"
+                f"sys.stderr.write(' '.join(n for n in {self.WITHHELD!r} if n in os.environ))\n"
+                "sys.exit(1)\n")
+            (root / "ok.py").write_text("x = 1\n")
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                result = validator._check_python(["ok.py"], root)
+            finally:
+                os.chdir(cwd)
+        self.assertTrue(result.passed, result.failures)
+
+    def test_every_build_subprocess_passes_build_env(self):
+        for name in ("_run_check", "_check_python"):
+            with self.subTest(name):
+                self.assertIn("env=build_env()",
+                              inspect.getsource(getattr(validator, name)))
+
+
 class TestInjectionShapeEndToEnd(unittest.TestCase):
     """The concrete example from the review: a comment in a scanned file that
     addresses the fixer directly."""
@@ -515,6 +581,7 @@ if __name__ == "__main__":
         TestFencingDoesNotBreakRedaction,
         TestToolScope,
         TestAgentEnv,
+        TestBuildCheckEnv,
         TestInjectionShapeEndToEnd,
         TestPromptNeverReachesArgv,
     ]

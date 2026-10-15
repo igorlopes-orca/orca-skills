@@ -266,7 +266,12 @@ anywhere, so all four `claude -p` calls inherited `ORCA_API_TOKEN`,
 passes an explicit list of names — never a pattern, since `NPM_TOKEN` would sail
 through any prefix rule written for npm. `fix_agent.extra_env` adds names for
 setups the default cannot know about, and refuses credential-shaped ones so the
-allowlist cannot be undone by accident. The orchestrator's own `gh` and `git`
+allowlist cannot be undone by accident. The local build checks (`npm run build`,
+`go build`, `terraform validate`, `cargo metadata`, `py_compile`) execute code the
+tenant wrote, so they get the same allowlist through `build_env()` with Claude's
+own credentials removed as well. `HOME` is still passed, so a build script can
+read credential files under it (`~/.config/gh`, `~/.aws`, `~/.npmrc`); closing
+that needs a sandbox, not an environment. The orchestrator's own `gh` and `git`
 subprocesses are untouched: they need those credentials and are not the untrusted
 party.
 

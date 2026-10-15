@@ -7,6 +7,11 @@ credentials `gh` was authenticated with. A process whose whole job is reading
 repository content — content an attacker can write — has no use for any of them,
 and all four call sites are covered here rather than one.
 
+The local build checks get the same allowlist through build_env(), minus Claude's
+own credentials: `npm run build` executes a script the tenant wrote, which is the
+untrusted party in person, and it has no more use for ANTHROPIC_API_KEY than for
+ORCA_API_TOKEN.
+
 The orchestrator's own `gh` and `git` subprocesses are deliberately untouched.
 They need those credentials, and they are not the untrusted party.
 """
@@ -41,7 +46,13 @@ _ALLOW = frozenset({
     "BUNDLE_PATH", "GEM_HOME", "GEM_PATH",
     "DOTNET_CLI_HOME", "NUGET_PACKAGES",
     "JAVA_HOME", "M2_HOME", "PIP_CACHE_DIR",
+    "GOTOOLCHAIN", "XDG_CACHE_HOME", "TF_PLUGIN_CACHE_DIR", "TF_DATA_DIR",
 })
+
+# Allowed for the model subprocess, which needs them to reach Claude; withheld
+# from build checks, which run repository code and need none of them.
+_MODEL_ONLY = frozenset(n for n in _ALLOW
+                        if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_")))
 
 # Names fix_agent.extra_env may never add back. The literal four are the ones
 # this change exists to withhold; the pattern catches the shape of the rest, so
@@ -73,3 +84,15 @@ def agent_env(extra: list | None = None) -> dict:
             continue
         allowed.add(name)
     return {k: v for k, v in os.environ.items() if k in allowed}
+
+
+def build_env(extra: list | None = None) -> dict:
+    """The environment for a build or syntax check run inside the cloned tree.
+
+    agent_env() without Claude's credentials. fix_agent.extra_env still applies,
+    so a private registry an operator opted into reaches the build that needs it.
+    """
+    env = agent_env(extra)
+    for name in _MODEL_ONLY:
+        env.pop(name, None)
+    return env

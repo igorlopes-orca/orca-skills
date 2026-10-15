@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from agent_env import agent_env
+from agent_env import agent_env, build_env
 from orca_client import _resolve_feature_type
 from paths import resolve_within
 from redact import build_redactor
@@ -456,7 +456,8 @@ def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
 
 def _run_check(cmd: list[str], cwd: Path) -> ValidationResult:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=cwd)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=cwd,
+                                env=build_env())
     except subprocess.TimeoutExpired:
         return ValidationResult(passed=False, phase="local_build",
                                 failures=[f"local build timed out ({' '.join(cmd)})"])
@@ -474,9 +475,11 @@ def _check_python(files: list[str], cwd: Path) -> ValidationResult:
     for f in files:
         if not f.endswith(".py"):
             continue
+        # -I: `-m` otherwise searches the current directory first, which is the
+        # cloned tree in single-repo mode, so a committed py_compile.py would run.
         result = subprocess.run(
-            ["python3", "-m", "py_compile", str(cwd / f)],
-            capture_output=True, text=True, timeout=15
+            ["python3", "-I", "-m", "py_compile", str(cwd / f)],
+            capture_output=True, text=True, timeout=15, env=build_env(),
         )
         if result.returncode != 0:
             failures.append(f"syntax error in {f}: {result.stderr[:150]}")
